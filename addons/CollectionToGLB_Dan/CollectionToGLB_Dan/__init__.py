@@ -20,6 +20,70 @@ from bpy.props import StringProperty, BoolProperty, IntProperty, FloatProperty, 
 from bpy.types import Panel, Operator, PropertyGroup, UIList
 from mathutils import Vector
 
+GITHUB_USER = "Dan-3D"
+GITHUB_REPO = "blender-addons"
+ADDON_NAME = "CollectionToGLB_Dan"
+CURRENT_VERSION = (1, 0, 0)
+
+def check_for_updates():
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/releases/latest"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Blender'})
+        response = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(response.read().decode())
+        latest_tag = data.get("tag_name", "v0")
+        version_str = latest_tag.replace("v", "")
+        latest_version = tuple(map(int, version_str.split(".")))
+        if latest_version > CURRENT_VERSION:
+            return True, data
+        return False, None
+    except:
+        return False, None
+
+def download_and_install(download_url):
+    try:
+        temp_path = os.path.join(bpy.app.tempdir, f"{ADDON_NAME}_update.zip")
+        urllib.request.urlretrieve(download_url, temp_path)
+        addons_path = bpy.utils.user_resource('SCRIPTS', path="addons")
+        addon_path = os.path.join(addons_path, ADDON_NAME)
+        if os.path.exists(addon_path):
+            shutil.rmtree(addon_path)
+        with zipfile.ZipFile(temp_path, 'r') as zip_ref:
+            zip_ref.extractall(addons_path)
+        os.remove(temp_path)
+        return True
+    except:
+        return False
+
+class UPDATE_OT_check(bpy.types.Operator):
+    bl_idname = "updater.check_update"
+    bl_label = "Check for Updates"
+    
+    def execute(self, context):
+        has_update, data = check_for_updates()
+        if has_update:
+            bpy.context.window_manager.update_available = True
+            self.report({'INFO'}, "Update available!")
+        else:
+            self.report({'INFO'}, "You have the latest version")
+        return {'FINISHED'}
+
+class UPDATE_OT_install(bpy.types.Operator):
+    bl_idname = "updater.install_update"
+    bl_label = "Install Update"
+    
+    def execute(self, context):
+        has_update, data = check_for_updates()
+        if has_update and data:
+            for asset in data.get("assets", []):
+                if ADDON_NAME in asset["name"] and asset["name"].endswith(".zip"):
+                    if download_and_install(asset["browser_download_url"]):
+                        self.report({'INFO'}, "Update installed! Restart Blender.")
+                    else:
+                        self.report({'ERROR'}, "Update failed")
+                    break
+        return {'FINISHED'}
+
 def delayed_cleanup(cleanup_data):
     """Cleanup function that runs after a delay to avoid preview job crashes"""
     
@@ -2333,4 +2397,5 @@ def unregister():
     del bpy.types.Scene.glb_export_props
 
 if __name__ == "__main__":
+
     register()
