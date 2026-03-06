@@ -12,13 +12,16 @@ import bpy
 import bmesh
 import os
 import re
+import json
 import subprocess
 import zipfile
 import tempfile
 import shutil
+import urllib.request
 from bpy.props import StringProperty, BoolProperty, IntProperty, FloatProperty, EnumProperty, CollectionProperty, PointerProperty
 from bpy.types import Panel, Operator, PropertyGroup, UIList
 from mathutils import Vector
+from bpy.props import BoolProperty
 
 GITHUB_USER = "Dan-3D"
 GITHUB_REPO = "blender-addons"
@@ -2399,3 +2402,4 @@ def unregister():
 if __name__ == "__main__":
 
     register()
+
