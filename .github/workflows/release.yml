@@ -13,16 +13,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
       
-      - name: Zip addons
+      - name: Get changed addon
+        id: changed
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD -- addons/ | head -1 | cut -d'/' -f2)
+          echo "addon=$CHANGED" >> $GITHUB_OUTPUT
+          
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(grep -oP 'version.*?\(\K[0-9, ]+' addons/${{ steps.changed.outputs.addon }}/__init__.py | tr -d ' ' | tr ',' '.')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          
+      - name: Zip addon
         run: |
           cd addons
-          for dir in */; do
-            zip -r "${dir%/}.zip" "$dir"
-          done
+          zip -r "${{ steps.changed.outputs.addon }}.zip" "${{ steps.changed.outputs.addon }}"
           
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: v${{ github.run_number }}
-          files: addons/*.zip
+          tag_name: ${{ steps.changed.outputs.addon }}-v${{ steps.version.outputs.version }}
+          name: ${{ steps.changed.outputs.addon }} v${{ steps.version.outputs.version }}
+          files: addons/${{ steps.changed.outputs.addon }}.zip
