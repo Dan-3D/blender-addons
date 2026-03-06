@@ -14,9 +14,11 @@ import os
 import re
 import json
 import subprocess
+import threading
 import zipfile
 import tempfile
 import shutil
+import addon_utils
 import urllib.request
 from bpy.props import StringProperty, BoolProperty, IntProperty, FloatProperty, EnumProperty, CollectionProperty, PointerProperty
 from bpy.types import Panel, Operator, PropertyGroup, UIList
@@ -25,67 +27,174 @@ from bpy.props import BoolProperty
 
 GITHUB_USER = "Dan-3D"
 GITHUB_REPO = "blender-addons"
-ADDON_NAME = "CollectionToGLB_Dan"
+ADDON_FOLDER = "CollectionToGLB_Dan"
 CURRENT_VERSION = (1, 0, 0)
 
-def check_for_updates():
-    try:
-        url = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/releases/latest"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Blender'})
-        response = urllib.request.urlopen(req, timeout=5)
-        data = json.loads(response.read().decode())
-        latest_tag = data.get("tag_name", "v0")
-        version_str = latest_tag.replace("v", "")
-        latest_version = tuple(map(int, version_str.split(".")))
-        if latest_version > CURRENT_VERSION:
-            return True, data
-        return False, None
-    except:
-        return False, None
+update_available = False
+latest_release_data = None
+update_checking = False
 
-def download_and_install(download_url):
+def get_current_version():
+    return CURRENT_VERSION
+
+def version_tuple_to_string(v):
+    return ".".join(map(str, v))
+
+def check_for_update_background():
+    global update_available, latest_release_data, update_checking
+    update_checking = True
     try:
-        temp_path = os.path.join(bpy.app.tempdir, f"{ADDON_NAME}_update.zip")
+        url = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/releases"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Blender'})
+        response = urllib.request.urlopen(req, timeout=10)
+        releases = json.loads(response.read().decode())
+        
+        for release in releases:
+            tag = release.get("tag_name", "")
+            if tag.startswith(ADDON_FOLDER):
+                version_str = tag.replace(f"{ADDON_FOLDER}-v", "").replace(f"{ADDON_FOLDER}-", "")
+                try:
+                    latest_version = tuple(map(int, version_str.split(".")))
+                    if latest_version > CURRENT_VERSION:
+                        update_available = True
+                        latest_release_data = release
+                except:
+                    pass
+                break
+    except Exception as e:
+        print(f"Update check failed: {e}")
+    update_checking = False
+
+def download_and_install_update():
+    global latest_release_data
+    if not latest_release_data:
+        return False, "No update data available"
+    
+    try:
+        assets = latest_release_data.get("assets", [])
+        download_url = None
+        
+        for asset in assets:
+            if asset["name"].endswith(".zip"):
+                download_url = asset["browser_download_url"]
+                break
+        
+        if not download_url:
+            return False, "No download URL found"
+        
+        temp_path = os.path.join(bpy.app.tempdir, f"{ADDON_FOLDER}_update.zip")
         urllib.request.urlretrieve(download_url, temp_path)
+        
         addons_path = bpy.utils.user_resource('SCRIPTS', path="addons")
-        addon_path = os.path.join(addons_path, ADDON_NAME)
+        addon_path = os.path.join(addons_path, ADDON_FOLDER)
+        
+        bpy.ops.preferences.addon_disable(module=ADDON_FOLDER)
+        
         if os.path.exists(addon_path):
             shutil.rmtree(addon_path)
+        
         with zipfile.ZipFile(temp_path, 'r') as zip_ref:
             zip_ref.extractall(addons_path)
+        
         os.remove(temp_path)
-        return True
-    except:
-        return False
+        
+        bpy.ops.preferences.addon_enable(module=ADDON_FOLDER)
+        
+        return True, "Update installed! Please restart Blender."
+    except Exception as e:
+        return False, f"Update failed: {e}"
 
-class UPDATE_OT_check(bpy.types.Operator):
+class UPDATER_OT_check(bpy.types.Operator):
     bl_idname = "updater.check_update"
     bl_label = "Check for Updates"
+    bl_description = "Check GitHub for addon updates"
     
     def execute(self, context):
-        has_update, data = check_for_updates()
-        if has_update:
-            bpy.context.window_manager.update_available = True
+        global update_available, update_checking
+        
+        if update_checking:
+            self.report({'INFO'}, "Already checking for updates...")
+            return {'FINISHED'}
+        
+        update_available = False
+        thread = threading.Thread(target=check_for_update_background)
+        thread.start()
+        thread.join(timeout=15)
+        
+        if update_available:
             self.report({'INFO'}, "Update available!")
         else:
             self.report({'INFO'}, "You have the latest version")
+        
         return {'FINISHED'}
 
-class UPDATE_OT_install(bpy.types.Operator):
+class UPDATER_OT_install(bpy.types.Operator):
     bl_idname = "updater.install_update"
     bl_label = "Install Update"
+    bl_description = "Download and install the latest version"
     
     def execute(self, context):
-        has_update, data = check_for_updates()
-        if has_update and data:
-            for asset in data.get("assets", []):
-                if ADDON_NAME in asset["name"] and asset["name"].endswith(".zip"):
-                    if download_and_install(asset["browser_download_url"]):
-                        self.report({'INFO'}, "Update installed! Restart Blender.")
-                    else:
-                        self.report({'ERROR'}, "Update failed")
-                    break
+        success, message = download_and_install_update()
+        if success:
+            self.report({'INFO'}, message)
+        else:
+            self.report({'ERROR'}, message)
         return {'FINISHED'}
+
+class UPDATER_OT_popup(bpy.types.Operator):
+    bl_idname = "updater.update_popup"
+    bl_label = "Update Available"
+    
+    def execute(self, context):
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=300)
+    
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text=f"{ADDON_FOLDER} update available!", icon='INFO')
+        layout.label(text=f"Current: v{version_tuple_to_string(CURRENT_VERSION)}")
+        if latest_release_data:
+            tag = latest_release_data.get("tag_name", "")
+            layout.label(text=f"Latest: {tag}")
+        layout.separator()
+        layout.operator("updater.install_update", text="Install Update", icon='IMPORT')
+
+class UPDATER_PT_panel(bpy.types.Panel):
+    bl_label = "Addon Updates"
+    bl_idname = "UPDATER_PT_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Col2GLB"
+    bl_options = {'DEFAULT_CLOSED'}
+    
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text=f"Version: {version_tuple_to_string(CURRENT_VERSION)}")
+        
+        if update_checking:
+            layout.label(text="Checking for updates...", icon='TIME')
+        elif update_available:
+            layout.label(text="Update available!", icon='ERROR')
+            layout.operator("updater.install_update", icon='IMPORT')
+        else:
+            layout.operator("updater.check_update", icon='FILE_REFRESH')
+
+def check_update_on_startup():
+    thread = threading.Thread(target=check_for_update_background)
+    thread.start()
+    return None
+
+def show_update_popup():
+    if update_available:
+        bpy.ops.updater.update_popup('INVOKE_DEFAULT')
+    return None
+
+@bpy.app.handlers.persistent
+def startup_handler(dummy):
+    bpy.app.timers.register(check_update_on_startup, first_interval=3.0)
+    bpy.app.timers.register(show_update_popup, first_interval=8.0)
 
 def delayed_cleanup(cleanup_data):
     """Cleanup function that runs after a delay to avoid preview job crashes"""
@@ -2363,11 +2472,12 @@ class GLB_PT_ExportPanel(Panel):
         col.operator("glb_export.process_export", text=button_text, icon='PLAY')
 
 # === REGISTRATION ===
-classes = (
-    UPDATE_OT_check,
-    
+classes = (   
     GLBExportProperties,
-    UPDATE_OT_install,
+    UPDATER_OT_check,
+    UPDATER_OT_install,
+    UPDATER_OT_popup,
+    UPDATER_PT_panel,
     GLB_OT_CleanupProcessedCollections,
     GLB_OT_OpenExportFolder,
     GLB_OT_ClearImportPath,
@@ -2382,6 +2492,7 @@ def register():
         bpy.utils.register_class(cls)
     
     bpy.types.Scene.glb_export_props = bpy.props.PointerProperty(type=GLBExportProperties)
+    bpy.app.handlers.load_post.append(startup_handler)
 
     # Check for MOF resource file
     addon_dir = os.path.dirname(os.path.realpath(__file__))
@@ -2397,14 +2508,17 @@ def register():
         print("=" * 60)
 
 def unregister():
+    if startup_handler in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(startup_handler)
+    
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     
     del bpy.types.Scene.glb_export_props
 
 if __name__ == "__main__":
-
     register()
+
 
 
 
