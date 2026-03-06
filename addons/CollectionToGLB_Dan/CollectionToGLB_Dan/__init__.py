@@ -2364,7 +2364,10 @@ class GLB_PT_ExportPanel(Panel):
 
 # === REGISTRATION ===
 classes = (
+    UPDATE_OT_check,
+    
     GLBExportProperties,
+    UPDATE_OT_install,
     GLB_OT_CleanupProcessedCollections,
     GLB_OT_OpenExportFolder,
     GLB_OT_ClearImportPath,
@@ -2402,4 +2405,5 @@ def unregister():
 if __name__ == "__main__":
 
     register()
+
 
