@@ -7,7 +7,7 @@ bl_info = {
     "description": "Export collections as GLB with automatic scaling and transforms",
     "category": "Import-Export",
 }
- 
+
 import bpy
 import bmesh
 import os
@@ -2518,6 +2518,7 @@ def unregister():
 
 if __name__ == "__main__":
     register()
+
 
 
 
