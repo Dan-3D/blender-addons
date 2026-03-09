@@ -161,13 +161,8 @@ class UPDATER_OT_popup(bpy.types.Operator):
         layout.separator()
         layout.operator("updater.install_update", text="Install Update", icon='IMPORT')
 
-class UPDATER_PT_panel(bpy.types.Panel):
-    bl_label = "Addon Updates"
-    bl_idname = "UPDATER_PT_panel"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "Col2GLB"
-    bl_options = {'DEFAULT_CLOSED'}
+class GLBExportPreferences(bpy.types.AddonPreferences):
+    bl_idname = ADDON_FOLDER
     
     def draw(self, context):
         layout = self.layout
@@ -2477,7 +2472,7 @@ classes = (
     UPDATER_OT_check,
     UPDATER_OT_install,
     UPDATER_OT_popup,
-    UPDATER_PT_panel,
+    GLBExportPreferences,
     GLB_OT_CleanupProcessedCollections,
     GLB_OT_OpenExportFolder,
     GLB_OT_ClearImportPath,
@@ -2518,6 +2513,7 @@ def unregister():
 
 if __name__ == "__main__":
     register()
+
 
 
 
