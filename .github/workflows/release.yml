@@ -1,53 +1,113 @@
-name: Create Release
+name: Build and Deploy Extensions
 
 on:
   push:
+    branches:
+      - main
     paths:
       - 'addons/**'
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
-  release:
+  build-and-deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-      
-      - name: Get changed addon
-        id: changed
-        run: |
-          CHANGED=$(git diff --name-only HEAD~1 HEAD -- addons/ | head -1 | cut -d'/' -f2)
-          echo "addon=$CHANGED" >> $GITHUB_OUTPUT
-          
-      - name: Get version
-        id: version
-        run: |
-          VERSION=$(grep -oP 'version.*?\(\K[0-9, ]+' addons/${{ steps.changed.outputs.addon }}/__init__.py | tr -d ' ' | tr ',' '.')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Check if release exists
-        id: check
-        run: |
-          TAG="${{ steps.changed.outputs.addon }}-v${{ steps.version.outputs.version }}"
-          if gh release view "$TAG" > /dev/null 2>&1; then
-            echo "Release $TAG already exists!"
-            echo "ERROR: Change version number in __init__.py before committing."
-            exit 1
-          fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
-      - name: Zip addon
-        run: |
-          cd addons
-          zip -r "${{ steps.changed.outputs.addon }}.zip" "${{ steps.changed.outputs.addon }}"
-          
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          tag_name: ${{ steps.changed.outputs.addon }}-v${{ steps.version.outputs.version }}
-          name: ${{ steps.changed.outputs.addon }} v${{ steps.version.outputs.version }}
-          files: addons/${{ steps.changed.outputs.addon }}.zip
+          python-version: '3.11'
+
+      - name: Build Extensions
+        run: |
+          mkdir -p dist
+          
+          for addon_dir in addons/*/; do
+            if [ -f "${addon_dir}blender_manifest.toml" ]; then
+              addon_name=$(basename "$addon_dir")
+              
+              # Get version from manifest
+              version=$(grep -oP 'version\s*=\s*"\K[^"]+' "${addon_dir}blender_manifest.toml")
+              
+              # Create zip
+              cd addons
+              zip -r "../dist/${addon_name}.zip" "$addon_name"
+              cd ..
+              
+              echo "Built: ${addon_name} v${version}"
+            fi
+          done
+
+      - name: Generate index.json
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          import tomllib
+          import hashlib
+
+          extensions = []
+
+          for addon_name in os.listdir('addons'):
+              manifest_path = f'addons/{addon_name}/blender_manifest.toml'
+              zip_path = f'dist/{addon_name}.zip'
+              
+              if os.path.exists(manifest_path) and os.path.exists(zip_path):
+                  with open(manifest_path, 'rb') as f:
+                      manifest = tomllib.load(f)
+                  
+                  # Calculate file size and hash
+                  with open(zip_path, 'rb') as f:
+                      content = f.read()
+                      size = len(content)
+                      sha256 = hashlib.sha256(content).hexdigest()
+                  
+                  ext = {
+                      "schema_version": manifest.get("schema_version", "1.0.0"),
+                      "id": manifest.get("id"),
+                      "name": manifest.get("name"),
+                      "version": manifest.get("version"),
+                      "tagline": manifest.get("tagline", ""),
+                      "maintainer": manifest.get("maintainer", ""),
+                      "type": manifest.get("type", "add-on"),
+                      "blender_version_min": manifest.get("blender_version_min", "4.2.0"),
+                      "archive_url": f"./{addon_name}.zip",
+                      "archive_size": size,
+                      "archive_hash": f"sha256:{sha256}"
+                  }
+                  
+                  if "permissions" in manifest:
+                      ext["permissions"] = manifest["permissions"]
+                  
+                  extensions.append(ext)
+                  print(f"Added: {manifest.get('name')} v{manifest.get('version')}")
+
+          index = {
+              "version": "1.0.0",
+              "blocklist": [],
+              "data": extensions
+          }
+
+          with open('dist/index.json', 'w') as f:
+              json.dump(index, f, indent=2)
+
+          print(f"\nGenerated index.json with {len(extensions)} extension(s)")
+          EOF
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
