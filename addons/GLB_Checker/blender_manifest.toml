@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+id = "glb_checker"
+name = "GLB Checker"
+version = "1.0.0"
+tagline = "Import and check GLB files one by one with rotation animation"
+maintainer = "Daniel Marcin"
+type = "add-on"
+blender_version_min = "4.5.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read and write files"
