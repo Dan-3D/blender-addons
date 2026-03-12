@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Videomockup Outputs",
     "author": "Dan",
-    "version": (1, 0),
+    "version": (1, 0, 0),
     "blender": (4, 3, 2),
     "location": "Node Editor > Sidebar > Videomockup",
     "description": "Set up compositing nodes for video mockup outputs",
@@ -2841,4 +2841,5 @@ def unregister():
 
 # Keep this part as is
 if __name__ == "__main__":
+
     register()
