@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+id = "glb_export_params"
+name = "Params Import & GLTF Export"
+version = "1.0.0"
+tagline = "Parses a text file for video type and parameters, then exports a GLTF."
+maintainer = "Filip&Dan"
+type = "add-on"
+blender_version_min = "4.3.2"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read and write files"
