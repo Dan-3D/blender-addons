@@ -1,4 +1,5 @@
 name: Build and Deploy Extensions
+
 on:
   push:
     branches:
@@ -6,10 +7,12 @@ on:
     paths:
       - 'addons/**'
   workflow_dispatch:
+
 permissions:
   contents: write
   pages: write
   id-token: write
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
@@ -17,106 +20,241 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Sync versions from bl_info to manifest
-        id: sync
+
+      - name: Validate, Generate TOML, and Check Versions
+        id: validate
         run: |
           python3 << 'EOF'
           import os
           import re
-          
-          changes_made = False
-          
-          for addon_name in os.listdir('addons'):
-              init_path = f'addons/{addon_name}/__init__.py'
-              manifest_path = f'addons/{addon_name}/blender_manifest.toml'
-              
-              if not os.path.exists(init_path) or not os.path.exists(manifest_path):
-                  continue
-              
-              with open(init_path, 'r') as f:
-                  content = f.read()
-              
+          import sys
+          import subprocess
+
+          errors = []
+          warnings = []
+          addons_to_build = []
+
+          def get_previous_file_content(filepath):
+              """Get file content from previous commit"""
+              try:
+                  result = subprocess.run(
+                      ['git', 'show', 'HEAD~1:' + filepath],
+                      capture_output=True,
+                      text=True
+                  )
+                  if result.returncode == 0:
+                      return result.stdout
+              except:
+                  pass
+              return None
+
+          def extract_bl_info(content):
+              """Extract bl_info dict from Python content"""
               match = re.search(r'bl_info\s*=\s*\{([^}]+)\}', content, re.DOTALL)
               if not match:
-                  continue
+                  return None
               
               bl_info_str = match.group(1)
               
+              info = {}
+              
+              # Extract version
               version_match = re.search(r'"version"\s*:\s*\((\d+),\s*(\d+),\s*(\d+)\)', bl_info_str)
-              if not version_match:
+              if version_match:
+                  info['version'] = f"{version_match.group(1)}.{version_match.group(2)}.{version_match.group(3)}"
+              
+              # Extract name
+              name_match = re.search(r'"name"\s*:\s*"([^"]+)"', bl_info_str)
+              if name_match:
+                  info['name'] = name_match.group(1)
+              
+              # Extract description
+              desc_match = re.search(r'"description"\s*:\s*"([^"]+)"', bl_info_str)
+              if desc_match:
+                  info['description'] = desc_match.group(1)
+              
+              # Extract author
+              author_match = re.search(r'"author"\s*:\s*"([^"]+)"', bl_info_str)
+              if author_match:
+                  info['author'] = author_match.group(1)
+              
+              # Extract blender version
+              blender_match = re.search(r'"blender"\s*:\s*\((\d+),\s*(\d+),\s*(\d+)\)', bl_info_str)
+              if blender_match:
+                  info['blender'] = f"{blender_match.group(1)}.{blender_match.group(2)}.{blender_match.group(3)}"
+              
+              return info
+
+          def generate_toml(addon_name, bl_info):
+              """Generate toml content from bl_info"""
+              addon_id = addon_name.lower().replace(' ', '_').replace('-', '_')
+              
+              toml_content = f'''schema_version = "1.0.0"
+          id = "{addon_id}"
+          name = "{bl_info.get('name', addon_name)}"
+          version = "{bl_info.get('version', '1.0.0')}"
+          tagline = "{bl_info.get('description', '')}"
+          maintainer = "{bl_info.get('author', '')}"
+          type = "add-on"
+          blender_version_min = "{bl_info.get('blender', '4.2.0')}"
+          license = ["SPDX:GPL-3.0-or-later"]
+
+          [permissions]
+          files = "Read and write files"
+          '''
+              return toml_content
+
+          def update_toml(toml_content, bl_info):
+              """Update existing toml with bl_info values"""
+              if 'version' in bl_info:
+                  toml_content = re.sub(
+                      r'version\s*=\s*"[^"]+"',
+                      f'version = "{bl_info["version"]}"',
+                      toml_content
+                  )
+              
+              if 'name' in bl_info:
+                  toml_content = re.sub(
+                      r'name\s*=\s*"[^"]+"',
+                      f'name = "{bl_info["name"]}"',
+                      toml_content
+                  )
+              
+              if 'description' in bl_info:
+                  toml_content = re.sub(
+                      r'tagline\s*=\s*"[^"]+"',
+                      f'tagline = "{bl_info["description"]}"',
+                      toml_content
+                  )
+              
+              if 'author' in bl_info:
+                  toml_content = re.sub(
+                      r'maintainer\s*=\s*"[^"]+"',
+                      f'maintainer = "{bl_info["author"]}"',
+                      toml_content
+                  )
+              
+              if 'blender' in bl_info:
+                  toml_content = re.sub(
+                      r'blender_version_min\s*=\s*"[^"]+"',
+                      f'blender_version_min = "{bl_info["blender"]}"',
+                      toml_content
+                  )
+              
+              return toml_content
+
+          # Process each addon
+          for addon_name in os.listdir('addons'):
+              addon_path = f'addons/{addon_name}'
+              
+              if not os.path.isdir(addon_path):
                   continue
               
-              version = f"{version_match.group(1)}.{version_match.group(2)}.{version_match.group(3)}"
+              init_path = f'{addon_path}/__init__.py'
+              manifest_path = f'{addon_path}/blender_manifest.toml'
               
-              name_match = re.search(r'"name"\s*:\s*"([^"]+)"', bl_info_str)
-              tagline_match = re.search(r'"description"\s*:\s*"([^"]+)"', bl_info_str)
-              author_match = re.search(r'"author"\s*:\s*"([^"]+)"', bl_info_str)
-              blender_match = re.search(r'"blender"\s*:\s*\((\d+),\s*(\d+),\s*(\d+)\)', bl_info_str)
+              # Check __init__.py exists
+              if not os.path.exists(init_path):
+                  warnings.append(f"{addon_name}: No __init__.py found, skipping")
+                  continue
               
-              with open(manifest_path, 'r') as f:
-                  original_manifest = f.read()
+              # Read current __init__.py
+              with open(init_path, 'r') as f:
+                  current_init = f.read()
               
-              manifest_content = original_manifest
+              # Extract bl_info
+              bl_info = extract_bl_info(current_init)
               
-              manifest_content = re.sub(
-                  r'version\s*=\s*"[^"]+"',
-                  f'version = "{version}"',
-                  manifest_content
-              )
+              if not bl_info:
+                  errors.append(f"{addon_name}: No bl_info found in __init__.py")
+                  continue
               
-              if name_match:
-                  manifest_content = re.sub(
-                      r'name\s*=\s*"[^"]+"',
-                      f'name = "{name_match.group(1)}"',
-                      manifest_content
-                  )
+              # Validate required fields
+              required_fields = ['name', 'version', 'author', 'description', 'blender']
+              missing = [f for f in required_fields if f not in bl_info]
               
-              if tagline_match:
-                  manifest_content = re.sub(
-                      r'tagline\s*=\s*"[^"]+"',
-                      f'tagline = "{tagline_match.group(1)}"',
-                      manifest_content
-                  )
+              if missing:
+                  errors.append(f"{addon_name}: bl_info missing required fields: {', '.join(missing)}")
+                  continue
               
-              if author_match:
-                  manifest_content = re.sub(
-                      r'maintainer\s*=\s*"[^"]+"',
-                      f'maintainer = "{author_match.group(1)}"',
-                      manifest_content
-                  )
+              # Check version change
+              previous_init = get_previous_file_content(init_path)
               
-              if blender_match:
-                  blender_ver = f"{blender_match.group(1)}.{blender_match.group(2)}.{blender_match.group(3)}"
-                  manifest_content = re.sub(
-                      r'blender_version_min\s*=\s*"[^"]+"',
-                      f'blender_version_min = "{blender_ver}"',
-                      manifest_content
-                  )
+              if previous_init:
+                  previous_bl_info = extract_bl_info(previous_init)
+                  
+                  # Remove bl_info for code comparison
+                  current_code = re.sub(r'bl_info\s*=\s*\{[^}]+\}', '', current_init).strip()
+                  previous_code = re.sub(r'bl_info\s*=\s*\{[^}]+\}', '', previous_init).strip()
+                  
+                  code_changed = current_code != previous_code
+                  
+                  if previous_bl_info:
+                      version_changed = bl_info.get('version') != previous_bl_info.get('version')
+                      
+                      if code_changed and not version_changed:
+                          errors.append(f"{addon_name}: Code changed but version not bumped. Current: {bl_info.get('version')}")
+                          continue
               
-              if manifest_content != original_manifest:
+              # Generate or update toml
+              if not os.path.exists(manifest_path):
+                  print(f"{addon_name}: Generating new blender_manifest.toml")
+                  toml_content = generate_toml(addon_name, bl_info)
                   with open(manifest_path, 'w') as f:
-                      f.write(manifest_content)
-                  changes_made = True
-                  print(f"Updated {addon_name}: v{version}")
+                      f.write(toml_content)
               else:
-                  print(f"No changes for {addon_name}: v{version}")
-          
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"changes_made={'true' if changes_made else 'false'}\n")
+                  with open(manifest_path, 'r') as f:
+                      toml_content = f.read()
+                  
+                  updated_toml = update_toml(toml_content, bl_info)
+                  
+                  if updated_toml != toml_content:
+                      print(f"{addon_name}: Updating blender_manifest.toml")
+                      with open(manifest_path, 'w') as f:
+                          f.write(updated_toml)
+              
+              addons_to_build.append({
+                  'name': addon_name,
+                  'version': bl_info['version'],
+                  'display_name': bl_info['name']
+              })
+              
+              print(f"{addon_name}: Valid (v{bl_info['version']})")
+
+          # Print warnings
+          for warning in warnings:
+              print(f"WARNING: {warning}")
+
+          # Handle errors
+          if errors:
+              print("\n=== ERRORS ===")
+              for error in errors:
+                  print(f"ERROR: {error}")
+              sys.exit(1)
+
+          # Save addons to build for later steps
+          import json
+          with open('addons_to_build.json', 'w') as f:
+              json.dump(addons_to_build, f)
+
+          print(f"\n=== {len(addons_to_build)} addon(s) ready to build ===")
           EOF
-      - name: Commit synced manifests
-        if: steps.sync.outputs.changes_made == 'true'
+
+      - name: Commit TOML changes
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add addons/*/blender_manifest.toml
-          git commit -m "Auto-sync manifest versions from bl_info [skip ci]"
-          git push
+          git diff --staged --quiet || git commit -m "Auto-sync manifest from bl_info [skip ci]"
+          git push || true
+
       - name: Build Extensions
         run: |
           mkdir -p dist
@@ -125,12 +263,18 @@ jobs:
             if [ -f "${addon_dir}blender_manifest.toml" ]; then
               addon_name=$(basename "$addon_dir")
               version=$(grep -oP 'version\s*=\s*"\K[^"]+' "${addon_dir}blender_manifest.toml")
+              
               cd addons
               zip -r "../dist/${addon_name}.zip" "$addon_name"
               cd ..
+              
+              # Also create versioned copy for releases
+              cp "dist/${addon_name}.zip" "dist/${addon_name}_v${version}.zip"
+              
               echo "Built: ${addon_name} v${version}"
             fi
           done
+
       - name: Generate index.json
         run: |
           python3 << 'EOF'
@@ -138,7 +282,9 @@ jobs:
           import os
           import tomllib
           import hashlib
+          
           extensions = []
+          
           for addon_name in os.listdir('addons'):
               manifest_path = f'addons/{addon_name}/blender_manifest.toml'
               zip_path = f'dist/{addon_name}.zip'
@@ -172,20 +318,100 @@ jobs:
                   
                   extensions.append(ext)
                   print(f"Added: {manifest.get('name')} v{manifest.get('version')}")
+          
           index = {
               "version": "1.0.0",
               "blocklist": [],
               "data": extensions
           }
+          
           with open('dist/index.json', 'w') as f:
               json.dump(index, f, indent=2)
+          
           print(f"\nGenerated index.json with {len(extensions)} extension(s)")
           EOF
+
+      - name: Generate Changelog and Create Releases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          import subprocess
+
+          # Load addons to build
+          if not os.path.exists('addons_to_build.json'):
+              print("No addons to build")
+              exit(0)
+
+          with open('addons_to_build.json', 'r') as f:
+              addons = json.load(f)
+
+          for addon in addons:
+              name = addon['name']
+              version = addon['version']
+              display_name = addon['display_name']
+              
+              tag_name = f"{name}_v{version}"
+              zip_file = f"dist/{name}_v{version}.zip"
+              
+              if not os.path.exists(zip_file):
+                  print(f"Zip not found: {zip_file}")
+                  continue
+              
+              # Check if release already exists
+              result = subprocess.run(
+                  ['gh', 'release', 'view', tag_name],
+                  capture_output=True,
+                  text=True
+              )
+              
+              release_exists = result.returncode == 0
+              
+              # Generate changelog from recent commits for this addon
+              changelog_result = subprocess.run(
+                  ['git', 'log', '--oneline', '-10', '--', f'addons/{name}/'],
+                  capture_output=True,
+                  text=True
+              )
+              
+              commits = changelog_result.stdout.strip()
+              
+              if commits:
+                  changelog = f"## {display_name} v{version}\n\n### Changes\n"
+                  for line in commits.split('\n'):
+                      if line and '[skip ci]' not in line:
+                          # Remove commit hash for cleaner look
+                          msg = ' '.join(line.split(' ')[1:])
+                          if msg:
+                              changelog += f"- {msg}\n"
+              else:
+                  changelog = f"## {display_name} v{version}\n\nInitial release."
+              
+              if release_exists:
+                  print(f"Updating release: {tag_name}")
+                  # Delete old release and tag
+                  subprocess.run(['gh', 'release', 'delete', tag_name, '-y', '--cleanup-tag'], capture_output=True)
+              
+              # Create new release
+              print(f"Creating release: {tag_name}")
+              subprocess.run([
+                  'gh', 'release', 'create', tag_name,
+                  zip_file,
+                  '--title', f"{display_name} v{version}",
+                  '--notes', changelog
+              ])
+
+          EOF
+
       - name: Setup Pages
         uses: actions/configure-pages@v4
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: dist
+
       - name: Deploy to GitHub Pages
         uses: actions/deploy-pages@v4
