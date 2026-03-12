@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+id = "svg_to_3d_layers"
+name = "SVG to 3D - Layers"
+version = "1.0.0"
+tagline = "Process SVG files with layer-based operations"
+maintainer = "Daniel Marcin - 3D & Mockups"
+type = "add-on"
+blender_version_min = "4.5.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read and write files"
