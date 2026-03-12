@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+id = "videomockups_addon"
+name = "Videomockup Outputs"
+version = "1.0.0"
+tagline = "Set up compositing nodes for video mockup outputs"
+maintainer = "Dan"
+type = "add-on"
+blender_version_min = "4.3.2"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read and write files"
