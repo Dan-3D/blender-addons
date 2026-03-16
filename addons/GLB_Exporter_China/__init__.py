@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GLB Exporter",
     "author": "Dan & Popi from 3D Content Team",
-    "version": (1, 0, 1),
+    "version": (1, 0, 2),
     "blender": (4, 2, 0),
     "description": "Export collections as GLB with automatic scaling and material baking",
     "category": "Import-Export",
