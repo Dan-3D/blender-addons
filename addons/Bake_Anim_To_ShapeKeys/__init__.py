@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Bake Animation to Shape Keys",
     "author": "adambb-code",
-    "version": (1, 2, 0),
+    "version": (1, 2, 1),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar (N-Panel) > GLB Bake",
     "description": "Bakes complex nested hierarchies and modifiers to shape keys for GLB export.",
@@ -532,7 +532,21 @@ def _est_poll_tick():
                     pass
                 if not sel:
                     sel = list(bpy.context.view_layer.active_layer_collection.collection.all_objects)
-            deform_objs = [o for o in gather_all_targets(sel) if collect_deform_fcurves([o])]
+            def _est_is_deforming(obj):
+                """Broader deform check for estimation: includes fcurve-driven,
+                constraint-driven, and cache-driven (Alembic, physics, GeoNodes) objects."""
+                if collect_deform_fcurves([obj]):
+                    return True
+                if obj.type == 'MESH':
+                    cache_types = {'MESH_SEQUENCE_CACHE', 'NODES', 'CLOTH',
+                                   'SOFT_BODY', 'FLUID', 'DYNAMIC_PAINT', 'EXPLODE'}
+                    if any(m.type in cache_types for m in obj.modifiers):
+                        return True
+                if any(getattr(c, 'target', None) is not None
+                       for c in getattr(obj, 'constraints', [])):
+                    return True
+                return False
+            deform_objs = [o for o in gather_all_targets(sel) if _est_is_deforming(o)]
             _EST['_deform_objs_cache'] = deform_objs
 
             # Vertex count for size estimate — evaluate depsgraph so modifiers

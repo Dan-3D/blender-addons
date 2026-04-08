@@ -1,7 +1,7 @@
 schema_version = "1.0.3"
 id = "bake_anim_to_shapekeys"
 name = "Bake Animation to Shape Keys"
-version = "1.2.0"
+version = "1.2.1"
 tagline = "Bake complex animations and modifiers to shape keys for GLB export"
 maintainer = "adambb-code"
 type = "add-on"
