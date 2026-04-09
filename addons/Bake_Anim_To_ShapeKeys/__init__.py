@@ -2,7 +2,7 @@ bl_info = {
     "name": "Bake Animation to Shape Keys",
     "author": "adambb-code",
     "version": (1, 2, 1),
-    "blender": (5, 1, 0),
+    "blender": (5, 0, 0),
     "location": "View3D > Sidebar (N-Panel) > GLB Bake",
     "description": "Bakes complex nested hierarchies and modifiers to shape keys for GLB export.",
     "category": "Import-Export",
