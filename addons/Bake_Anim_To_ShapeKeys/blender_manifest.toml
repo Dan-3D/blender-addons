@@ -9,4 +9,4 @@ blender_version_min = "5.1.0"
 license = ["SPDX:GPL-3.0-or-later"]
 
 [permissions]
-files = "Export GLB files"
+files = "Read and write files"
