@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 5, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -104,6 +104,84 @@ def download_and_install_update():
     except Exception as e:
         return False, f"Update failed: {e}"
 
+
+class GLB_UL_CustomUVBakeTargets(UIList):
+    bl_idname = "GLB_UL_CustomUVBakeTargets"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        if item.object_ref:
+            row.prop(item, "object_ref", text="", icon='OBJECT_DATA')
+            row.prop(item, "uv_map_name", text="")
+        else:
+            row.prop(item, "object_ref", text="", icon='OBJECT_DATA')
+            row.label(text="(pick an object)")
+
+
+class GLB_OT_ScanCustomUVTargets(Operator):
+    bl_idname = "glb_export.scan_custom_uv_targets"
+    bl_label = "Scan Collection"
+    bl_description = "Scan view-layer-enabled collections for mesh objects with 2+ UV maps"
+
+    def execute(self, context):
+        props = context.scene.glb_export_props
+        existing = {t.object_ref.name for t in props.custom_uv_bake_targets if t.object_ref}
+        found = 0
+
+        def walk(layer_coll):
+            nonlocal found
+            # Skip collections unchecked in the view layer
+            if layer_coll.exclude:
+                return
+            coll = layer_coll.collection
+            for obj in coll.objects:
+                if obj.type == 'MESH' and obj.data and len(obj.data.uv_layers) > 1:
+                    if obj.name not in existing:
+                        new_item = props.custom_uv_bake_targets.add()
+                        new_item.object_ref = obj
+                        existing.add(obj.name)
+                        found += 1
+            for child in layer_coll.children:
+                walk(child)
+
+        for layer_coll in context.view_layer.layer_collection.children:
+            walk(layer_coll)
+
+        self.report({'INFO'}, f"Found {found} new object(s) with multiple UV maps")
+        return {'FINISHED'}
+
+
+class GLB_OT_AddCustomUVTarget(Operator):
+    bl_idname = "glb_export.add_custom_uv_target"
+    bl_label = "Add Target"
+    bl_description = "Add a new empty entry to the list"
+
+    def execute(self, context):
+        props = context.scene.glb_export_props
+        props.custom_uv_bake_targets.add()
+        props.custom_uv_bake_index = len(props.custom_uv_bake_targets) - 1
+        return {'FINISHED'}
+
+
+class GLB_OT_RemoveCustomUVTarget(Operator):
+    bl_idname = "glb_export.remove_custom_uv_target"
+    bl_label = "Remove Target"
+    bl_description = "Remove the selected entry from the list"
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.glb_export_props
+        return len(props.custom_uv_bake_targets) > 0
+
+    def execute(self, context):
+        props = context.scene.glb_export_props
+        idx = props.custom_uv_bake_index
+        if 0 <= idx < len(props.custom_uv_bake_targets):
+            props.custom_uv_bake_targets.remove(idx)
+            props.custom_uv_bake_index = max(0, idx - 1)
+        return {'FINISHED'}
+
+
 class UPDATER_OT_check(bpy.types.Operator):
     bl_idname = "updater.check_update"
     bl_label = "Check for Updates"
@@ -128,6 +206,7 @@ class UPDATER_OT_check(bpy.types.Operator):
         
         return {'FINISHED'}
 
+
 class UPDATER_OT_install(bpy.types.Operator):
     bl_idname = "updater.install_update"
     bl_label = "Install Update"
@@ -140,6 +219,7 @@ class UPDATER_OT_install(bpy.types.Operator):
         else:
             self.report({'ERROR'}, message)
         return {'FINISHED'}
+
 
 class UPDATER_OT_popup(bpy.types.Operator):
     bl_idname = "updater.update_popup"
@@ -160,6 +240,7 @@ class UPDATER_OT_popup(bpy.types.Operator):
             layout.label(text=f"Latest: {tag}")
         layout.separator()
         layout.operator("updater.install_update", text="Install Update", icon='IMPORT')
+
 
 class UPDATER_PT_panel(bpy.types.Panel):
     bl_label = "Addon Updates"
@@ -268,6 +349,42 @@ def update_uv_method(self, context):
         self.show_packing_settings = True
 
 # === PROPERTY GROUPS ===
+
+def get_uv_maps_for_object(self, context):
+    """Dynamic enum - returns UV maps of the referenced object."""
+    items = []
+    if self.object_ref and self.object_ref.type == 'MESH' and self.object_ref.data:
+        for i, uv_layer in enumerate(self.object_ref.data.uv_layers):
+            items.append((uv_layer.name, uv_layer.name, f"Bake to {uv_layer.name}", i))
+    if not items:
+        items.append(('NONE', "(no UV maps)", "Object has no UV maps", 0))
+    return items
+
+
+def poll_mesh_with_multiple_uvs(self, obj):
+    if obj.type != 'MESH' or not obj.data:
+        return False
+    if len(obj.data.uv_layers) <= 1:
+        return False
+    view_layer = bpy.context.view_layer
+    if view_layer.objects.get(obj.name) is None:
+        return False
+    return True
+
+
+class GLBBakeUVTarget(PropertyGroup):
+    object_ref: PointerProperty(
+        name="Object",
+        type=bpy.types.Object,
+        description="Object to bake to a specific UV map",
+        poll=poll_mesh_with_multiple_uvs,
+    )
+    uv_map_name: EnumProperty(
+        name="Target UV Map",
+        description="UV map this object's material will be baked into",
+        items=get_uv_maps_for_object,
+    )
+
 
 class GLBExportProperties(PropertyGroup):
     
@@ -432,6 +549,28 @@ class GLBExportProperties(PropertyGroup):
         update=update_uv_pack
     )
     
+    enable_uv_pack: BoolProperty(
+        name="Pack UVs",
+        description="Pack UV islands after unwrapping",
+        default=True,
+    )
+    enable_custom_uv_bake: BoolProperty(
+        name="Enable Custom UV Bake",
+        description="Bake specific objects to a chosen UV map instead of the global UV method",
+        default=False,
+    )
+    show_custom_uv_bake: BoolProperty(
+        name="Show Custom UV Bake Settings",
+        default=True,
+    )
+    custom_uv_bake_targets: CollectionProperty(
+        type=GLBBakeUVTarget,
+    )
+    custom_uv_bake_index: IntProperty(
+        name="Active Target Index",
+        default=0,
+    )
+
     pack_shape_method: EnumProperty(
         name="Shape Method",
         description="Method to use for packing UV islands",
@@ -702,6 +841,13 @@ class GLB_OT_ProcessAndExport(Operator):
         self.baked_materials = [] 
         self.collections_data = collections_to_process
         
+        # Set engine to Cycles ONCE for the whole export. Avoids repeated shader
+        # recompilation when toggling engine per collection.
+        self._original_engine = context.scene.render.engine
+        self._original_samples = context.scene.cycles.samples
+        context.scene.render.engine = 'CYCLES'
+        context.scene.cycles.samples = context.scene.glb_export_props.bake_samples
+        
         collection_names = [col_data['collection'].name for col_data in collections_to_process]
         
         self._collections_to_process = collection_names
@@ -903,6 +1049,10 @@ class GLB_OT_ProcessAndExport(Operator):
                 scale_factor = 1.0 / max_dimension
                 
                 for obj in all_duplicated_objects:
+                    # Store values needed to compensate Texture Coordinate during bake
+                    obj["_glb_max_dim"] = max_dimension
+                    obj["_glb_loc_before_transform"] = list(obj.location)
+                    
                     obj.scale *= scale_factor
                     obj.location *= scale_factor
                     
@@ -914,6 +1064,8 @@ class GLB_OT_ProcessAndExport(Operator):
                 center = [(min_coords[i] + max_coords[i]) * 0.5 * scale_factor for i in range(3)]
                 
                 for obj in all_duplicated_objects:
+                    obj["_glb_center"] = list(center)
+                    
                     obj.location[0] -= center[0]
                     obj.location[1] -= center[1]
                     obj.location[2] -= center[2]
@@ -990,11 +1142,57 @@ class GLB_OT_ProcessAndExport(Operator):
             
             mesh_objects = sorted(mesh_objects, key=lambda o: o.name)
             
-            # Join
-            bpy.ops.object.join()
+            # Custom UV Bake: peel off listed objects and bake them individually first
+            custom_uv_baked_objs = []
+            custom_bake_only = False
+            if props.enable_custom_uv_bake and len(props.custom_uv_bake_targets) > 0:
+                target_map = {}
+                for t in props.custom_uv_bake_targets:
+                    if t.object_ref and t.uv_map_name and t.uv_map_name != 'NONE':
+                        target_map[t.object_ref.name] = t.uv_map_name
 
-            # Get the joined object
-            joined_obj = context.active_object
+                if target_map:
+                    selected = list(context.selected_objects)
+                    peeled = [o for o in selected if o.get("original_name", o.name) in target_map]
+                    remaining = [o for o in selected if o.get("original_name", o.name) not in target_map]
+
+                    if props.enable_baking:
+                        for pobj in peeled:
+                            self.update_progress(
+                                context,
+                                f"Custom UV bake: {pobj.get('original_name', pobj.name)}",
+                                current_idx, total_count,
+                            )
+                            lookup_name = pobj.get("original_name", pobj.name)
+                            if self.bake_listed_object(context, pobj, target_map[lookup_name]):
+                                custom_uv_baked_objs.append((pobj, target_map[lookup_name]))
+
+                    # Re-select remaining objects for the join
+                    bpy.ops.object.select_all(action='DESELECT')
+                    for o in remaining:
+                        o.select_set(True)
+                    if remaining:
+                        context.view_layer.objects.active = remaining[0]
+
+                    # All collection objects were custom-baked - skip the main pipeline entirely
+                    if not remaining and custom_uv_baked_objs:
+                        custom_bake_only = True
+                        bpy.ops.object.select_all(action='DESELECT')
+                        for pobj, _ in custom_uv_baked_objs:
+                            if pobj.name in bpy.data.objects:
+                                pobj.select_set(True)
+                        first_pobj = custom_uv_baked_objs[0][0]
+                        context.view_layer.objects.active = first_pobj
+                        if len(custom_uv_baked_objs) > 1:
+                            bpy.ops.object.join()
+                        joined_obj = context.active_object
+                        joined_obj.name = original_name
+
+            if not custom_bake_only:
+                bpy.ops.object.join()
+
+                # Get the joined object
+                joined_obj = context.active_object
             if not joined_obj:
                 print("WARNING: No object after joining! Skipping this collection.")
                 return None
@@ -1031,7 +1229,7 @@ class GLB_OT_ProcessAndExport(Operator):
             print(f"Materials use UV coordinates: {materials_use_uvs}")
 
             # Handle UV maps based on detection
-            if props.uv_unwrap_method != 'NONE':
+            if props.uv_unwrap_method != 'NONE' and not custom_bake_only:
                 self.update_progress(context, "UV unwrapping...", current_idx, total_count)
                 
                 if materials_use_uvs:
@@ -1119,16 +1317,13 @@ class GLB_OT_ProcessAndExport(Operator):
                         print(f"Warning: Could not pack UVs: {e}")
                         bpy.ops.object.mode_set(mode='OBJECT')
             
-            if props.enable_baking:
+            if props.enable_baking and not custom_bake_only:
                 original_materials = []
                 for slot in joined_obj.material_slots:
                     if slot.material:
                         original_materials.append(slot.material)
-                
+
                 self.update_progress(context, f"File: {original_name} | Material: BAKING", current_idx, total_count)
-                
-                original_engine = context.scene.render.engine
-                original_samples = context.scene.cycles.samples
                 
                 denoising_settings = {}
                 
@@ -1185,6 +1380,11 @@ class GLB_OT_ProcessAndExport(Operator):
                         
                         y_offset = 300
                         
+                        # Inject Mapping nodes to compensate for the addon's scale + center
+                        # transforms, so procedural textures using Texture Coordinate -> Object
+                        # (or Geometry -> Position) bake at original size on the joined object.
+                        coord_splices = self.inject_coord_compensation(joined_obj)
+                        
                         if bake_data['color']['needs_baking']:
                             print("Baking color...")
                             color_image = self.create_image(f"{joined_obj.name}_Color", props.bake_resolution, 'sRGB')
@@ -1228,24 +1428,53 @@ class GLB_OT_ProcessAndExport(Operator):
                             print("Baking normal...")
                             normal_image = self.create_image(f"{joined_obj.name}_Normal", props.bake_resolution, 'Non-Color')
                             self.bake_normal(joined_obj, materials, normal_image)
-                            
+
                             tex_node = new_nodes.new('ShaderNodeTexImage')
                             tex_node.image = normal_image
                             tex_node.location = (-600, y_offset)
-                            
+
                             normal_map_node = new_nodes.new('ShaderNodeNormalMap')
                             normal_map_node.location = (-200, y_offset)
                             normal_map_node.inputs['Strength'].default_value = 1.0
-                            
+
                             new_links.new(tex_node.outputs['Color'], normal_map_node.inputs['Color'])
                             new_links.new(normal_map_node.outputs['Normal'], principled.inputs['Normal'])
-                            
+                            y_offset -= 300
+
+                        # Alpha handling
+                        if not bake_data['alpha'].get('skip', False):
+                            if bake_data['alpha']['needs_baking']:
+                                print("Baking alpha...")
+                                alpha_image = self.create_image(f"{joined_obj.name}_Alpha", props.bake_resolution, 'Non-Color')
+                                self.bake_channel(joined_obj, materials, alpha_image, 'EMIT', 'Alpha', bake_data['alpha'])
+
+                                tex_node = new_nodes.new('ShaderNodeTexImage')
+                                tex_node.image = alpha_image
+                                tex_node.location = (-400, y_offset)
+                                new_links.new(tex_node.outputs['Color'], principled.inputs['Alpha'])
+                                y_offset -= 300
+                            else:
+                                principled.inputs['Alpha'].default_value = bake_data['alpha']['uniform_value']
+                            # Set the material to BLEND mode so transparency is honored on export.
+                            # Force backface culling so glTF exports doubleSided=False, otherwise
+                            # back faces render through front faces in BLEND mode and look like
+                            # ghost transparency on actually-opaque areas of the texture.
+                            new_mat.blend_method = 'BLEND'
+                            new_mat.use_backface_culling = True
+                            if hasattr(new_mat, 'surface_render_method'):
+                                new_mat.surface_render_method = 'BLENDED'
+
                         if props.bake_ambient_occlusion:
                             print("Baking ambient occlusion...")
                             ao_image = self.create_image(f"{joined_obj.name}_AO", props.bake_resolution, 'Non-Color')
                             self.bake_ambient_occlusion(joined_obj, ao_image)
                             
                             self.create_gltf_output_node(new_mat, ao_image)
+                        
+                        # Remove the injected Mapping nodes from the source materials.
+                        # joined_obj's material slots will be replaced by new_mat below,
+                        # but the source materials still live in bpy.data.materials.
+                        self.remove_coord_compensation(coord_splices)
                         
                         joined_obj.data.materials.clear()
                         joined_obj.data.materials.append(new_mat)
@@ -1271,6 +1500,12 @@ class GLB_OT_ProcessAndExport(Operator):
                 except Exception as e:
                     print(f"Error during baking: {str(e)}")
                     
+                    # If a bake threw mid-way, clean up any Mapping splices we injected
+                    try:
+                        self.remove_coord_compensation(coord_splices)
+                    except (NameError, Exception):
+                        pass
+                    
                     joined_obj.data.materials.clear()
                     for mat in original_materials:
                         joined_obj.data.materials.append(mat)
@@ -1279,13 +1514,31 @@ class GLB_OT_ProcessAndExport(Operator):
                     self.report({'WARNING'}, f"Baking failed for {original_name}: {str(e)}")
                     
                 finally:
-                    context.scene.render.engine = original_engine
-                    context.scene.cycles.samples = original_samples
-                    
                     for attr, value in denoising_settings.items():
                         if hasattr(context.scene.cycles, attr):
                             setattr(context.scene.cycles, attr, value)
-            
+
+            # Merge custom-baked objects into joined_obj AFTER main bake,
+            # preserving their target UV layers
+            if custom_uv_baked_objs and joined_obj and joined_obj.name in bpy.data.objects:
+                target_uv_names = {uv_name for _, uv_name in custom_uv_baked_objs}
+                for uv_name in target_uv_names:
+                    if uv_name not in joined_obj.data.uv_layers:
+                        joined_obj.data.uv_layers.new(name=uv_name)
+
+                bpy.ops.object.select_all(action='DESELECT')
+                joined_obj.select_set(True)
+                context.view_layer.objects.active = joined_obj
+                for pobj, _ in custom_uv_baked_objs:
+                    if pobj.name in bpy.data.objects:
+                        pobj.select_set(True)
+
+                try:
+                    bpy.ops.object.join()
+                    joined_obj = context.active_object
+                except Exception as e:
+                    print(f"Warning: Could not merge custom-baked objects: {e}")
+
             progress = int((current_idx / total_count) * 100)
             context.workspace.status_text_set(
                 f"BATCH PROCESSING | {current_idx} of {total_count} files | {progress}% | "
@@ -1356,6 +1609,10 @@ class GLB_OT_ProcessAndExport(Operator):
             context.view_layer.objects.active = original_active
 
     def cancel(self, context):
+        # Restore engine/samples to what they were before the export started
+        if hasattr(self, '_original_engine'):
+            context.scene.render.engine = self._original_engine
+            context.scene.cycles.samples = self._original_samples
         wm = context.window_manager
         wm.event_timer_remove(self._timer)
         
@@ -1382,6 +1639,11 @@ class GLB_OT_ProcessAndExport(Operator):
         bpy.app.timers.register(delayed_cleanup(cleanup_data), first_interval=1.5)
         
     def finish(self, context):
+        # Restore engine/samples to what they were before the export started
+        if hasattr(self, '_original_engine'):
+            context.scene.render.engine = self._original_engine
+            context.scene.cycles.samples = self._original_samples
+
         wm = context.window_manager
         wm.event_timer_remove(self._timer)
         
@@ -1614,7 +1876,8 @@ class GLB_OT_ProcessAndExport(Operator):
             'color': {'needs_baking': False, 'uniform_value': (0.8, 0.8, 0.8, 1.0), 'has_connections': []},
             'metallic': {'needs_baking': False, 'uniform_value': 0.0, 'has_connections': []},
             'roughness': {'needs_baking': False, 'uniform_value': 0.5, 'has_connections': []},
-            'normal': {'needs_baking': False, 'has_connections': []}
+            'normal': {'needs_baking': False, 'has_connections': []},
+            'alpha': {'needs_baking': False, 'uniform_value': 1.0, 'has_connections': []},
         }
         
         # Check each material
@@ -1679,7 +1942,23 @@ class GLB_OT_ProcessAndExport(Operator):
             if normal_input.is_linked:
                 data['normal']['has_connections'].append(True)
                 data['normal']['needs_baking'] = True
-        
+
+            # Check Alpha
+            alpha_input = principled.inputs['Alpha']
+            if alpha_input.is_linked:
+                data['alpha']['has_connections'].append(True)
+            else:
+                data['alpha']['has_connections'].append(False)
+                if not data['alpha']['needs_baking']:
+                    if len(materials) == 1:
+                        data['alpha']['uniform_value'] = alpha_input.default_value
+                    elif 'first_value' in data['alpha']:
+                        if abs(data['alpha']['first_value'] - alpha_input.default_value) > 0.001:
+                            data['alpha']['needs_baking'] = True
+                    else:
+                        data['alpha']['first_value'] = alpha_input.default_value
+                        data['alpha']['uniform_value'] = alpha_input.default_value
+
         # Final check - if any material has connections, we need to bake
         if any(data['color']['has_connections']):
             data['color']['needs_baking'] = True
@@ -1687,7 +1966,16 @@ class GLB_OT_ProcessAndExport(Operator):
             data['metallic']['needs_baking'] = True
         if any(data['roughness']['has_connections']):
             data['roughness']['needs_baking'] = True
-        
+        if any(data['alpha']['has_connections']):
+            data['alpha']['needs_baking'] = True
+
+        # Special case: if all alphas are effectively fully opaque (>= 0.999), skip alpha
+        # entirely so we don't accidentally set the material to BLEND mode.
+        if not data['alpha']['needs_baking'] and data['alpha']['uniform_value'] >= 0.999:
+            data['alpha']['skip'] = True
+        else:
+            data['alpha']['skip'] = False
+
         return data
     
     def prepare_materials_for_baking(self, materials, bake_data):
@@ -1770,7 +2058,134 @@ class GLB_OT_ProcessAndExport(Operator):
                     # Connect Value node to Roughness
                     links.new(value_node.outputs['Value'], roughness_input)
                     print(f"   - Created Value node for {mat.name}: {roughness_input.default_value}")
+
+        # Process Alpha
+        if bake_data['alpha']['needs_baking'] and not any(bake_data['alpha']['has_connections']):
+            print("Converting differing Alpha values to Value nodes...")
+            for mat in materials:
+                if not mat.use_nodes:
+                    continue
+
+                principled = self.get_principled_node(mat)
+                if not principled:
+                    continue
+
+                alpha_input = principled.inputs['Alpha']
+                if not alpha_input.is_linked:
+                    nodes = mat.node_tree.nodes
+                    links = mat.node_tree.links
+
+                    value_node = nodes.new('ShaderNodeValue')
+                    value_node.outputs['Value'].default_value = alpha_input.default_value
+                    value_node.location = (principled.location[0] - 300, principled.location[1] - 300)
+                    value_node.label = "Bake Prep Alpha"
+
+                    links.new(value_node.outputs['Value'], alpha_input)
+                    print(f"   - Created Value node for {mat.name}: {alpha_input.default_value}")
     
+    def inject_coord_compensation(self, obj):
+        """Inject Mapping nodes after every Texture Coordinate -> Object output, so that
+        procedural textures (Brick, Noise, etc.) using object coordinates bake at the
+        original scale and alignment despite the addon's scale/center transforms.
+        Returns a list of splice records to be undone by remove_coord_compensation()."""
+        max_dim = obj.get("_glb_max_dim")
+        loc_before = obj.get("_glb_loc_before_transform")
+        center = obj.get("_glb_center")
+        
+        if not max_dim or not loc_before or not center:
+            return []
+        
+        # Compensation math (Mapping in Point mode does: out = scale * in + location):
+        #   current_local = (orig_local + loc_before) * (1/max_dim) - center
+        #   we want output = orig_local
+        #   => scale = max_dim, location = max_dim * center - loc_before
+        comp_scale = (float(max_dim), float(max_dim), float(max_dim))
+        comp_location = (
+            float(max_dim) * center[0] - loc_before[0],
+            float(max_dim) * center[1] - loc_before[1],
+            float(max_dim) * center[2] - loc_before[2],
+        )
+        
+        splices = []
+        materials = [slot.material for slot in obj.material_slots
+                     if slot.material and slot.material.use_nodes]
+        
+        # Outputs that carry world/local positional data and get distorted by the
+        # addon's scale/center transforms. Other coordinate sources are left alone:
+        #   Generated     -> auto-normalizes to the mesh bbox (scale-invariant)
+        #   Normal        -> direction vector (scale-invariant)
+        #   UV            -> 2D, already in [0,1]
+        #   Camera/Window/Reflection -> view-dependent, not mesh-dependent
+        compensation_targets = {
+            'TEX_COORD': ('Object',),
+            'NEW_GEOMETRY': ('Position',),
+        }
+        
+        for mat in materials:
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+            
+            for src_node in list(nodes):
+                output_names = compensation_targets.get(src_node.type)
+                if not output_names:
+                    continue
+                
+                for out_name in output_names:
+                    out_socket = src_node.outputs.get(out_name)
+                    if not out_socket or not out_socket.is_linked:
+                        continue
+                    
+                    # Snapshot existing consumers before we modify links
+                    original_targets = [link.to_socket for link in out_socket.links]
+                    
+                    # Create a Mapping node and route all consumers through it
+                    mapping_node = nodes.new('ShaderNodeMapping')
+                    mapping_node.vector_type = 'POINT'
+                    mapping_node.label = "_glb_compensation"
+                    mapping_node.location = (src_node.location.x + 200, src_node.location.y - 100)
+                    mapping_node.inputs['Scale'].default_value = comp_scale
+                    mapping_node.inputs['Location'].default_value = comp_location
+                    
+                    # Disconnect originals, route through Mapping, reconnect downstream
+                    for link in list(out_socket.links):
+                        links.remove(link)
+                    links.new(out_socket, mapping_node.inputs['Vector'])
+                    for to_socket in original_targets:
+                        links.new(mapping_node.outputs['Vector'], to_socket)
+                    
+                    splices.append({
+                        'material': mat,
+                        'mapping_node': mapping_node,
+                        'src_socket': out_socket,
+                        'targets': original_targets,
+                    })
+        
+        return splices
+    
+    def remove_coord_compensation(self, splices):
+        """Undo inject_coord_compensation: remove Mapping nodes and reconnect originals."""
+        for splice in splices:
+            try:
+                mat = splice['material']
+                mapping_node = splice['mapping_node']
+                src_socket = splice['src_socket']
+                targets = splice['targets']
+                links = mat.node_tree.links
+                
+                # Drop links touching the Mapping node
+                for link in list(mapping_node.inputs['Vector'].links):
+                    links.remove(link)
+                for link in list(mapping_node.outputs['Vector'].links):
+                    links.remove(link)
+                
+                # Reconnect src directly to original consumers
+                for to_socket in targets:
+                    links.new(src_socket, to_socket)
+                
+                mat.node_tree.nodes.remove(mapping_node)
+            except Exception as e:
+                print(f"Warning: failed to remove coord compensation splice: {e}")
+
     def get_principled_node(self, material):
         """Find Principled BSDF node in material"""
         for node in material.node_tree.nodes:
@@ -1782,8 +2197,284 @@ class GLB_OT_ProcessAndExport(Operator):
         """Create a new image for baking"""
         image = bpy.data.images.new(name, resolution, resolution)
         image.colorspace_settings.name = color_space
-        self.created_images.append(image)  # Add this line
+        self.created_images.append(image)
         return image
+    
+    def bake_listed_object(self, context, obj, target_uv_name):
+        """Bake one object's materials to a chosen UV map, producing a new material
+        with UV Map nodes explicitly pointing at target_uv_name."""
+        props = context.scene.glb_export_props
+
+        if not obj.data or target_uv_name == 'NONE' or target_uv_name not in obj.data.uv_layers:
+            print(f"Custom UV bake skipped for {obj.name}: target UV '{target_uv_name}' not found")
+            return False
+
+        materials = [slot.material for slot in obj.material_slots if slot.material]
+        if not materials:
+            print(f"Custom UV bake skipped for {obj.name}: no materials")
+            return False
+
+        # Detect source UV: first UV layer that isn't the target
+        source_uv_name = None
+        for uv in obj.data.uv_layers:
+            if uv.name != target_uv_name:
+                source_uv_name = uv.name
+                break
+        if not source_uv_name:
+            print(f"Custom UV bake skipped for {obj.name}: no source UV (need 2+ UV layers)")
+            return False
+
+        # Select & activate this object only
+        bpy.ops.object.select_all(action='DESELECT')
+        context.view_layer.objects.active = obj
+        obj.select_set(True)
+
+        # Make the target UV the active one — this is what bake writes to.
+        # Use the same API pattern the main bake uses (collection-level .active),
+        # otherwise tangent space and AO bakes compute from the wrong UV.
+        target_uv_layer = obj.data.uv_layers.get(target_uv_name)
+        if target_uv_layer is not None:
+            obj.data.uv_layers.active = target_uv_layer
+            target_uv_layer.active_render = True
+
+        # Temporarily force source texture nodes to read from source_uv_name so the
+        # bake samples the original projection. We walk backwards through any chain
+        # of Mapping/Reroute nodes to find the real coordinate source, then handle
+        # three cases:
+        #   1) UVMAP node            -> change its uv_map to the source UV
+        #   2) TEX_COORD.UV socket   -> splice in a UVMAP node before the consumer
+        #   3) TEX_COORD.Object/Gen/Normal or Geometry -> leave alone (procedural)
+        temp_uv_wiring = []
+        TEX_NODES = {'TEX_IMAGE', 'TEX_NOISE', 'TEX_VORONOI', 'TEX_MUSGRAVE',
+                     'TEX_WAVE', 'TEX_BRICK', 'TEX_CHECKER', 'TEX_GRADIENT', 'TEX_MAGIC'}
+
+        def find_coord_source(socket, visited=None):
+            """Walk backwards through Mapping/Reroute nodes; return (node, output_socket) or (None, None)."""
+            if visited is None:
+                visited = set()
+            if not socket.is_linked:
+                return (None, None)
+            link = socket.links[0]
+            from_node = link.from_node
+            if from_node.name in visited:
+                return (None, None)
+            visited.add(from_node.name)
+            if from_node.type in {'MAPPING', 'REROUTE'}:
+                # Mapping has 'Vector' input, Reroute has 'Input'
+                next_input = from_node.inputs.get('Vector') or (from_node.inputs[0] if from_node.inputs else None)
+                if next_input is None:
+                    return (None, None)
+                return find_coord_source(next_input, visited)
+            return (from_node, link.from_socket)
+
+        for mat in materials:
+            if not mat.use_nodes:
+                continue
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+            for node in list(nodes):
+                if node.type not in TEX_NODES:
+                    continue
+                vector_input = node.inputs.get('Vector')
+                if not vector_input:
+                    continue
+
+                if not vector_input.is_linked:
+                    # No coordinate source at all - inject a UVMAP feeding source UV
+                    uv_map_node = nodes.new('ShaderNodeUVMap')
+                    uv_map_node.uv_map = source_uv_name
+                    uv_map_node.location = (node.location.x - 250, node.location.y)
+                    links.new(uv_map_node.outputs['UV'], vector_input)
+                    temp_uv_wiring.append(('ADDED', mat, uv_map_node, node))
+                    continue
+
+                source_node, source_socket = find_coord_source(vector_input)
+                if source_node is None:
+                    continue
+
+                if source_node.type == 'UVMAP':
+                    # Case 1: redirect existing UVMAP to source UV
+                    original_uv = source_node.uv_map
+                    source_node.uv_map = source_uv_name
+                    temp_uv_wiring.append(('MODIFIED', mat, source_node, original_uv))
+
+                elif source_node.type == 'TEX_COORD' and source_socket.name == 'UV':
+                    # Case 2: TEX_COORD.UV reads the active UV (which is the bake target).
+                    # Splice in a UVMAP node pointing to source_uv_name to override that.
+                    # Find the consumer that this socket directly feeds.
+                    for link in list(source_socket.links):
+                        consumer_socket = link.to_socket
+                        # Only redirect links that lead (directly or via Mapping/Reroute) to this texture node.
+                        # Easiest: redirect every consumer of TEX_COORD.UV that's reachable to a TEX node.
+                        uv_map_node = nodes.new('ShaderNodeUVMap')
+                        uv_map_node.uv_map = source_uv_name
+                        uv_map_node.location = (source_node.location.x + 200, source_node.location.y - 150)
+                        links.remove(link)
+                        links.new(uv_map_node.outputs['UV'], consumer_socket)
+                        temp_uv_wiring.append(('SPLICED_TC_UV', mat, uv_map_node,
+                                               source_socket, consumer_socket))
+                    # Stop after first splice for this texture node — repeated TEX_COORD.UV
+                    # consumers will be handled when their own texture nodes are processed.
+
+                # Case 3: TEX_COORD.Object/Generated/Normal or NEW_GEOMETRY -> leave alone
+                # (procedural, handled by Mapping compensation elsewhere)
+
+        # Analyze + prep
+        bake_data = self.analyze_materials(materials)
+        self.prepare_materials_for_baking(materials, bake_data)
+        bake_data = self.analyze_materials(materials)
+
+        # Build new baked material
+        new_mat = bpy.data.materials.new(name=f"{obj.name}_BakedCustomUV")
+        new_mat.use_nodes = True
+        self.baked_materials.append(new_mat)
+
+        nodes = new_mat.node_tree.nodes
+        links = new_mat.node_tree.links
+        nodes.clear()
+
+        output = nodes.new('ShaderNodeOutputMaterial')
+        output.location = (400, 0)
+        principled = nodes.new('ShaderNodeBsdfPrincipled')
+        principled.location = (100, 0)
+        links.new(principled.outputs['BSDF'], output.inputs['Surface'])
+
+        y = 300
+
+        def wire_texture(image, input_name, non_color=False):
+            nonlocal y
+            tex = nodes.new('ShaderNodeTexImage')
+            tex.image = image
+            if non_color:
+                tex.image.colorspace_settings.name = 'Non-Color'
+            tex.location = (-400, y)
+            
+            # Pin Vector to target UV explicitly. Without this, the texture samples
+            # from the active UV — which after re-merge is UVMap, not the target.
+            uv_node = nodes.new('ShaderNodeUVMap')
+            uv_node.uv_map = target_uv_name
+            uv_node.location = (-650, y)
+            links.new(uv_node.outputs['UV'], tex.inputs['Vector'])
+            
+            links.new(tex.outputs['Color'], principled.inputs[input_name])
+            y -= 300
+            return tex
+        coord_splices = []
+        try:
+            # Inject Mapping nodes to compensate for the addon's scale + location transforms
+            # so procedural textures using Texture Coordinate -> Object bake at original size
+            coord_splices = self.inject_coord_compensation(obj)
+            
+            if bake_data['color']['needs_baking']:
+                img = self.create_image(f"{obj.name}_Color", props.bake_resolution, 'sRGB')
+                self.bake_channel(obj, materials, img, 'EMIT', 'Base Color', bake_data['color'])
+                wire_texture(img, 'Base Color')
+            else:
+                principled.inputs['Base Color'].default_value = bake_data['color']['uniform_value']
+
+            if bake_data['metallic']['needs_baking']:
+                img = self.create_image(f"{obj.name}_Metallic", props.bake_resolution, 'Non-Color')
+                self.bake_channel(obj, materials, img, 'EMIT', 'Metallic', bake_data['metallic'])
+                wire_texture(img, 'Metallic', non_color=True)
+            else:
+                principled.inputs['Metallic'].default_value = bake_data['metallic']['uniform_value']
+
+            if bake_data['roughness']['needs_baking']:
+                img = self.create_image(f"{obj.name}_Roughness", props.bake_resolution, 'Non-Color')
+                self.bake_channel(obj, materials, img, 'EMIT', 'Roughness', bake_data['roughness'])
+                wire_texture(img, 'Roughness', non_color=True)
+            else:
+                principled.inputs['Roughness'].default_value = bake_data['roughness']['uniform_value']
+
+            if bake_data['normal']['needs_baking']:
+                img = self.create_image(f"{obj.name}_Normal", props.bake_resolution, 'Non-Color')
+                self.bake_normal(obj, materials, img)
+                tex = nodes.new('ShaderNodeTexImage')
+                tex.image = img
+                tex.location = (-400, y)
+                
+                # Pin Vector to target UV
+                uv_node = nodes.new('ShaderNodeUVMap')
+                uv_node.uv_map = target_uv_name
+                uv_node.location = (-650, y)
+                links.new(uv_node.outputs['UV'], tex.inputs['Vector'])
+                
+                normal_map_node = nodes.new('ShaderNodeNormalMap')
+                normal_map_node.location = (-150, y)
+                links.new(tex.outputs['Color'], normal_map_node.inputs['Color'])
+                links.new(normal_map_node.outputs['Normal'], principled.inputs['Normal'])
+                y -= 300
+
+            # Alpha handling — same logic as main bake
+            if not bake_data['alpha'].get('skip', False):
+                if bake_data['alpha']['needs_baking']:
+                    img = self.create_image(f"{obj.name}_Alpha", props.bake_resolution, 'Non-Color')
+                    self.bake_channel(obj, materials, img, 'EMIT', 'Alpha', bake_data['alpha'])
+                    tex = nodes.new('ShaderNodeTexImage')
+                    tex.image = img
+                    tex.image.colorspace_settings.name = 'Non-Color'
+                    tex.location = (-400, y)
+                    
+                    # Pin Vector to target UV
+                    uv_node = nodes.new('ShaderNodeUVMap')
+                    uv_node.uv_map = target_uv_name
+                    uv_node.location = (-650, y)
+                    links.new(uv_node.outputs['UV'], tex.inputs['Vector'])
+                    
+                    links.new(tex.outputs['Color'], principled.inputs['Alpha'])
+                    y -= 300
+                else:
+                    principled.inputs['Alpha'].default_value = bake_data['alpha']['uniform_value']
+                # Set the material to BLEND mode so transparency is honored on export.
+                # Force backface culling so glTF exports doubleSided=False, otherwise
+                # back faces render through front faces in BLEND mode and look like
+                # ghost transparency on actually-opaque areas of the texture.
+                new_mat.blend_method = 'BLEND'
+                new_mat.use_backface_culling = True
+                if hasattr(new_mat, 'surface_render_method'):
+                    new_mat.surface_render_method = 'BLENDED'
+
+            if props.bake_ambient_occlusion:
+                img = self.create_image(f"{obj.name}_AO", props.bake_resolution, 'Non-Color')
+                self.bake_ambient_occlusion(obj, img)
+                self.create_gltf_output_node(new_mat, img, uv_map_name=target_uv_name)
+        finally:
+            # Remove the injected Mapping nodes (always, even if a bake threw)
+            self.remove_coord_compensation(coord_splices)
+            
+            # Restore source materials to original UV wiring
+            for entry in temp_uv_wiring:
+                kind = entry[0]
+                try:
+                    if kind == 'ADDED':
+                        _, mat, uv_map_node, target_node = entry
+                        for link in list(target_node.inputs['Vector'].links):
+                            mat.node_tree.links.remove(link)
+                        mat.node_tree.nodes.remove(uv_map_node)
+                    elif kind == 'MODIFIED':
+                        _, mat, uv_map_node, original_uv = entry
+                        uv_map_node.uv_map = original_uv
+                    elif kind == 'SPLICED_TC_UV':
+                        _, mat, uv_map_node, original_source_socket, consumer_socket = entry
+                        # Remove the spliced UVMAP node's link, restore original TEX_COORD.UV link
+                        for link in list(uv_map_node.outputs['UV'].links):
+                            mat.node_tree.links.remove(link)
+                        mat.node_tree.links.new(original_source_socket, consumer_socket)
+                        mat.node_tree.nodes.remove(uv_map_node)
+                except Exception as e:
+                    print(f"Warning: UV wiring cleanup failed: {e}")
+
+        obj.data.materials.clear()
+        obj.data.materials.append(new_mat)
+
+        # Keep only the target UV layer on this object
+        uv_names_to_remove = [uv.name for uv in obj.data.uv_layers if uv.name != target_uv_name]
+        for uv_name in uv_names_to_remove:
+            if uv_name in obj.data.uv_layers:
+                obj.data.uv_layers.remove(obj.data.uv_layers[uv_name])
+
+        print(f"Custom UV bake complete for {obj.name} → {target_uv_name} (source: {source_uv_name})")
+        return True
     
     def bake_channel(self, obj, materials, target_image, bake_type, channel_name, bake_data):
         props = bpy.context.scene.glb_export_props
@@ -2028,7 +2719,7 @@ class GLB_OT_ProcessAndExport(Operator):
         for mat, node in temp_nodes:
             mat.node_tree.nodes.remove(node)
 
-    def create_gltf_output_node(self, material, ao_image):
+    def create_gltf_output_node(self, material, ao_image, uv_map_name=None):
         """Create glTF Material Output node and connect AO"""
         if not material.use_nodes:
             return
@@ -2069,7 +2760,14 @@ class GLB_OT_ProcessAndExport(Operator):
             ao_tex_node = nodes.new('ShaderNodeTexImage')
             ao_tex_node.image = ao_image
             ao_tex_node.location = (0, -300)
-        
+            
+            # If a specific UV map was requested, pin the texture's Vector to it
+            if uv_map_name:
+                uv_node = nodes.new('ShaderNodeUVMap')
+                uv_node.uv_map = uv_map_name
+                uv_node.location = (-250, -300)
+                links.new(uv_node.outputs['UV'], ao_tex_node.inputs['Vector'])
+
         links.new(ao_tex_node.outputs['Color'], gltf_node.inputs['Occlusion'])
 
 def natural_sort_key(text):
@@ -2077,6 +2775,7 @@ def natural_sort_key(text):
     def atoi(text):
         return int(text) if text.isdigit() else text
     return [atoi(c) for c in re.split(r'(\d+)', text)]
+
 
 class GLB_OT_ImportBlendFiles(Operator):
     """Import all blend files from selected folder into organized collections"""
@@ -2222,6 +2921,7 @@ class GLB_OT_ImportBlendFiles(Operator):
         self.report({'INFO'}, f"Imported {imported_count} files, skipped {skipped_count} existing")
         return {'FINISHED'}
 
+
 class GLB_OT_SelectImportFolder(Operator):
     """Select folder containing blend files to import"""
     bl_idname = "glb_export.select_import_folder"
@@ -2244,6 +2944,7 @@ class GLB_OT_SelectImportFolder(Operator):
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
+    
     
 class GLB_OT_ClearImportPath(Operator):
     """Clear the import folder path"""
@@ -2425,7 +3126,33 @@ class GLB_PT_ExportPanel(Panel):
                 # Pack to
                 row = uv_col.row(align=True)
                 row.prop(props, "pack_udim_target", text="")
-        
+
+        # Custom UV Bake section
+        layout.separator()
+        box = layout.box()
+        row = box.row()
+        row.prop(props, "show_custom_uv_bake",
+                 icon='TRIA_DOWN' if props.show_custom_uv_bake else 'TRIA_RIGHT',
+                 icon_only=True, emboss=False)
+        row.label(text="Custom UV Bake (per-object)")
+        if props.show_custom_uv_bake:
+            box.prop(props, "enable_custom_uv_bake")
+
+            if props.enable_custom_uv_bake:
+                box.operator("glb_export.scan_custom_uv_targets", icon='VIEWZOOM')
+
+                list_row = box.row()
+                list_row.template_list(
+                    "GLB_UL_CustomUVBakeTargets", "",
+                    props, "custom_uv_bake_targets",
+                    props, "custom_uv_bake_index",
+                    rows=3,
+                )
+
+                btn_col = list_row.column(align=True)
+                btn_col.operator("glb_export.add_custom_uv_target", icon='ADD', text="")
+                btn_col.operator("glb_export.remove_custom_uv_target", icon='REMOVE', text="")
+
         # Baking settings
         layout.separator()
         box = layout.box()
@@ -2473,7 +3200,12 @@ class GLB_PT_ExportPanel(Panel):
 
 # === REGISTRATION ===
 classes = (   
+    GLBBakeUVTarget,
     GLBExportProperties,
+    GLB_UL_CustomUVBakeTargets,
+    GLB_OT_ScanCustomUVTargets,
+    GLB_OT_AddCustomUVTarget,
+    GLB_OT_RemoveCustomUVTarget,
     UPDATER_OT_check,
     UPDATER_OT_install,
     UPDATER_OT_popup,
