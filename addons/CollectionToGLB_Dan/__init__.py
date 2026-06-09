@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 5, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -20,6 +20,7 @@ import tempfile
 import shutil
 import addon_utils
 import urllib.request
+import numpy as np
 from bpy.props import StringProperty, BoolProperty, IntProperty, FloatProperty, EnumProperty, CollectionProperty, PointerProperty
 from bpy.types import Panel, Operator, PropertyGroup, UIList
 from mathutils import Vector
@@ -1518,6 +1519,21 @@ class GLB_OT_ProcessAndExport(Operator):
                         if hasattr(context.scene.cycles, attr):
                             setattr(context.scene.cycles, attr, value)
 
+            elif props.bake_ambient_occlusion and not custom_bake_only:
+                # AO-only mode: keep existing materials & UV, just add baked AO
+                self.update_progress(context, f"File: {original_name} | AO-only bake", current_idx, total_count)
+                context.scene.render.engine = 'CYCLES'
+                try:
+                    ao_image = self.create_image(f"{joined_obj.name}_AO", props.bake_resolution, 'Non-Color')
+                    self.bake_ambient_occlusion(joined_obj, ao_image)
+                    for slot in joined_obj.material_slots:
+                        if slot.material:
+                            self.create_gltf_output_node(slot.material, ao_image)
+                    print(f"AO-only bake complete for {joined_obj.name}")
+                except Exception as e:
+                    print(f"AO-only bake failed: {e}")
+                    self.report({'WARNING'}, f"AO bake failed for {original_name}: {e}")
+
             # Merge custom-baked objects into joined_obj AFTER main bake,
             # preserving their target UV layers
             if custom_uv_baked_objs and joined_obj and joined_obj.name in bpy.data.objects:
@@ -2345,7 +2361,7 @@ class GLB_OT_ProcessAndExport(Operator):
             nonlocal y
             tex = nodes.new('ShaderNodeTexImage')
             tex.image = image
-            if non_color:
+            if non_color and tex.image.colorspace_settings.name != 'Non-Color':
                 tex.image.colorspace_settings.name = 'Non-Color'
             tex.location = (-400, y)
             
@@ -2410,12 +2426,13 @@ class GLB_OT_ProcessAndExport(Operator):
                 if bake_data['alpha']['needs_baking']:
                     img = self.create_image(f"{obj.name}_Alpha", props.bake_resolution, 'Non-Color')
                     self.bake_channel(obj, materials, img, 'EMIT', 'Alpha', bake_data['alpha'])
+
                     tex = nodes.new('ShaderNodeTexImage')
                     tex.image = img
-                    tex.image.colorspace_settings.name = 'Non-Color'
+                    if tex.image.colorspace_settings.name != 'Non-Color':
+                        tex.image.colorspace_settings.name = 'Non-Color'
                     tex.location = (-400, y)
                     
-                    # Pin Vector to target UV
                     uv_node = nodes.new('ShaderNodeUVMap')
                     uv_node.uv_map = target_uv_name
                     uv_node.location = (-650, y)
@@ -3161,16 +3178,15 @@ class GLB_PT_ExportPanel(Panel):
         row.label(text="Material Baking")
         if props.show_baking:
             box.prop(props, "enable_baking")
-        
-            if props.enable_baking:
+            box.prop(props, "bake_ambient_occlusion")
+
+            if props.enable_baking or props.bake_ambient_occlusion:
                 col = box.column(align=True)
-                col.prop(props, "bake_ambient_occlusion")
-                # Add AO settings when AO is enabled
                 if props.bake_ambient_occlusion:
                     ao_col = col.column(align=True)
                     ao_col.prop(props, "ao_samples")
                     ao_col.prop(props, "ao_distance")
-                
+
                 col.separator()
                 col.prop(props, "bake_resolution")
                 col.prop(props, "bake_samples")
