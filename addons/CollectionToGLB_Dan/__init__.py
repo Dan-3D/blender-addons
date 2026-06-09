@@ -29,7 +29,7 @@ from bpy.props import BoolProperty
 GITHUB_USER = "Dan-3D"
 GITHUB_REPO = "blender-addons"
 ADDON_FOLDER = "CollectionToGLB_Dan"
-CURRENT_VERSION = (1, 1, 0)
+CURRENT_VERSION = (1, 2, 0)
 
 update_available = False
 latest_release_data = None
