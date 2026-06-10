@@ -1,8 +1,8 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 2, 0),
-    "blender": (4, 5, 0),
+    "version": (1, 3, 0),
+    "blender": (5, 1, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
     "category": "Import-Export",
@@ -29,7 +29,7 @@ from bpy.props import BoolProperty
 GITHUB_USER = "Dan-3D"
 GITHUB_REPO = "blender-addons"
 ADDON_FOLDER = "CollectionToGLB_Dan"
-CURRENT_VERSION = (1, 2, 0)
+CURRENT_VERSION = (1, 1, 0)
 
 update_available = False
 latest_release_data = None
@@ -180,6 +180,63 @@ class GLB_OT_RemoveCustomUVTarget(Operator):
         if 0 <= idx < len(props.custom_uv_bake_targets):
             props.custom_uv_bake_targets.remove(idx)
             props.custom_uv_bake_index = max(0, idx - 1)
+        return {'FINISHED'}
+
+
+class GLB_UL_AOExceptions(UIList):
+    bl_idname = "GLB_UL_AOExceptions"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "object_ref", text="", icon='OBJECT_DATA')
+
+
+class GLB_OT_AddAOException(Operator):
+    bl_idname = "glb_export.add_ao_exception"
+    bl_label = "Add Exception"
+    bl_description = "Add a new empty entry to the list"
+
+    def execute(self, context):
+        props = context.scene.glb_export_props
+        props.ao_exception_objects.add()
+        props.ao_exception_index = len(props.ao_exception_objects) - 1
+        return {'FINISHED'}
+
+
+class GLB_OT_RemoveAOException(Operator):
+    bl_idname = "glb_export.remove_ao_exception"
+    bl_label = "Remove Exception"
+    bl_description = "Remove the selected entry from the list"
+
+    @classmethod
+    def poll(cls, context):
+        return len(context.scene.glb_export_props.ao_exception_objects) > 0
+
+    def execute(self, context):
+        props = context.scene.glb_export_props
+        idx = props.ao_exception_index
+        if 0 <= idx < len(props.ao_exception_objects):
+            props.ao_exception_objects.remove(idx)
+            props.ao_exception_index = max(0, idx - 1)
+        return {'FINISHED'}
+
+
+class GLB_OT_AddSelectedAOExceptions(Operator):
+    bl_idname = "glb_export.add_selected_ao_exceptions"
+    bl_label = "Add Selected Objects"
+    bl_description = "Add all selected viewport objects to the AO exception list"
+
+    def execute(self, context):
+        props = context.scene.glb_export_props
+        existing = {e.object_ref.name for e in props.ao_exception_objects if e.object_ref}
+        added = 0
+        for obj in context.selected_objects:
+            if obj.type in {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'} and obj.name not in existing:
+                item = props.ao_exception_objects.add()
+                item.object_ref = obj
+                existing.add(obj.name)
+                added += 1
+        self.report({'INFO'}, f"Added {added} object(s) to AO exceptions")
         return {'FINISHED'}
 
 
@@ -384,6 +441,19 @@ class GLBBakeUVTarget(PropertyGroup):
         name="Target UV Map",
         description="UV map this object's material will be baked into",
         items=get_uv_maps_for_object,
+    )
+
+
+def poll_ao_exception_object(self, obj):
+    return obj.type in {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'}
+
+
+class GLBAOExceptionItem(PropertyGroup):
+    object_ref: PointerProperty(
+        name="Object",
+        type=bpy.types.Object,
+        description="This object will not cast ambient occlusion onto other objects",
+        poll=poll_ao_exception_object,
     )
 
 
@@ -691,6 +761,18 @@ class GLBExportProperties(PropertyGroup):
         subtype='DISTANCE'
     )
     
+    show_ao_exceptions: BoolProperty(default=False)
+
+    ao_use_exceptions: BoolProperty(
+        name="AO Exceptions",
+        description="Objects in the list will not cast ambient occlusion onto other objects",
+        default=False
+    )
+
+    ao_exception_objects: CollectionProperty(type=GLBAOExceptionItem)
+
+    ao_exception_index: IntProperty(default=0)
+
     bake_resolution: IntProperty(
         name="Resolution",
         description="Texture resolution for baking",
@@ -840,6 +922,7 @@ class GLB_OT_ProcessAndExport(Operator):
         self.temp_collections = []
         self.created_images = [] 
         self.baked_materials = [] 
+        self.deferred_ao_parts = []
         self.collections_data = collections_to_process
         
         # Set engine to Cycles ONCE for the whole export. Avoids repeated shader
@@ -922,6 +1005,7 @@ class GLB_OT_ProcessAndExport(Operator):
                     
                     self._current_collection += 1
                 else:
+                    self.merge_deferred_ao_parts(context)
                     if self.processed_objects and context.scene.glb_export_props.export_enabled:
                         self.export_combined_glb(context)
                     self.finish(context)
@@ -931,6 +1015,11 @@ class GLB_OT_ProcessAndExport(Operator):
     
     def duplicate_all_collections(self, context):
         print("=== DUPLICATING ALL COLLECTIONS ===")
+
+        props = context.scene.glb_export_props
+        ao_exception_names = set()
+        if props.ao_use_exceptions and props.bake_ambient_occlusion:
+            ao_exception_names = {e.object_ref.name for e in props.ao_exception_objects if e.object_ref}
         
         def hide_all_except_lighting(layer_col):
             if layer_col.collection.name != "Lighting":
@@ -974,6 +1063,8 @@ class GLB_OT_ProcessAndExport(Operator):
                 all_duplicated_objects.append(new_obj)
                 
                 new_obj["original_name"] = obj.name
+                if obj.name in ao_exception_names:
+                    new_obj["ao_exception"] = True
                 new_obj["original_location"] = obj.location.copy()
                 new_obj["original_rotation"] = obj.rotation_euler.copy()
                 new_obj["original_scale"] = obj.scale.copy()
@@ -1105,6 +1196,13 @@ class GLB_OT_ProcessAndExport(Operator):
         # Collect mesh objects
         mesh_objects = [obj for obj in temp_collection.objects if obj.type == 'MESH']
         print(f"Have {len(mesh_objects)} mesh objects to process")
+
+        # Mark AO-exception geometry with a vertex group so it survives the join
+        if props.ao_use_exceptions and props.bake_ambient_occlusion:
+            for obj in mesh_objects:
+                if obj.get("ao_exception") and "AO_EXCEPT_TMP" not in obj.vertex_groups:
+                    vg = obj.vertex_groups.new(name="AO_EXCEPT_TMP")
+                    vg.add(list(range(len(obj.data.vertices))), 1.0, 'REPLACE')
         
         # Go directly to merging vertices
         self.update_progress(context, "Merging vertices...", current_idx, total_count)
@@ -1143,30 +1241,30 @@ class GLB_OT_ProcessAndExport(Operator):
             
             mesh_objects = sorted(mesh_objects, key=lambda o: o.name)
             
-            # Custom UV Bake: peel off listed objects and bake them individually first
-            custom_uv_baked_objs = []
+            # Custom UV bake: peel listed objects out of the auto-unwrap.
+            # Their chosen UV map is preserved (pinned, rotation kept) and merged
+            # into the collection's single UV map before packing & baking.
+            custom_uv_peeled = []
             custom_bake_only = False
+            has_custom_pinned = False
             if props.enable_custom_uv_bake and len(props.custom_uv_bake_targets) > 0:
                 target_map = {}
                 for t in props.custom_uv_bake_targets:
-                    if t.object_ref and t.uv_map_name and t.uv_map_name != 'NONE':
+                    if t.object_ref and t.uv_map_name:
                         target_map[t.object_ref.name] = t.uv_map_name
 
                 if target_map:
-                    selected = list(context.selected_objects)
-                    peeled = [o for o in selected if o.get("original_name", o.name) in target_map]
-                    remaining = [o for o in selected if o.get("original_name", o.name) not in target_map]
+                    all_objs = list(mesh_objects)
+                    peeled = [o for o in all_objs if o.get("original_name", o.name) in target_map]
+                    remaining = [o for o in all_objs if o not in peeled]
 
-                    if props.enable_baking:
-                        for pobj in peeled:
-                            self.update_progress(
-                                context,
-                                f"Custom UV bake: {pobj.get('original_name', pobj.name)}",
-                                current_idx, total_count,
-                            )
-                            lookup_name = pobj.get("original_name", pobj.name)
-                            if self.bake_listed_object(context, pobj, target_map[lookup_name]):
-                                custom_uv_baked_objs.append((pobj, target_map[lookup_name]))
+                    for pobj in peeled:
+                        uv_name = target_map[pobj.get("original_name", pobj.name)]
+                        if pobj.type == 'MESH' and uv_name in pobj.data.uv_layers:
+                            custom_uv_peeled.append((pobj, uv_name))
+                        else:
+                            print(f"Warning: UV map '{uv_name}' not found on {pobj.name}; merging into main join")
+                            remaining.append(pobj)
 
                     # Re-select remaining objects for the join
                     bpy.ops.object.select_all(action='DESELECT')
@@ -1175,19 +1273,25 @@ class GLB_OT_ProcessAndExport(Operator):
                     if remaining:
                         context.view_layer.objects.active = remaining[0]
 
-                    # All collection objects were custom-baked - skip the main pipeline entirely
-                    if not remaining and custom_uv_baked_objs:
+                    # All collection objects are custom-UV: join them now, skip auto-unwrap
+                    if not remaining and custom_uv_peeled:
                         custom_bake_only = True
+                        has_custom_pinned = True
+                        for pobj, uv_name in custom_uv_peeled:
+                            self.prepare_custom_uv_object(None, pobj, uv_name)
                         bpy.ops.object.select_all(action='DESELECT')
-                        for pobj, _ in custom_uv_baked_objs:
+                        for pobj, _ in custom_uv_peeled:
                             if pobj.name in bpy.data.objects:
                                 pobj.select_set(True)
-                        first_pobj = custom_uv_baked_objs[0][0]
+                        first_pobj = custom_uv_peeled[0][0]
                         context.view_layer.objects.active = first_pobj
-                        if len(custom_uv_baked_objs) > 1:
+                        if len(custom_uv_peeled) > 1:
                             bpy.ops.object.join()
                         joined_obj = context.active_object
                         joined_obj.name = original_name
+                        if "UVMap" in joined_obj.data.uv_layers:
+                            joined_obj.data.uv_layers.active = joined_obj.data.uv_layers["UVMap"]
+                        custom_uv_peeled = []  # already merged
 
             if not custom_bake_only:
                 bpy.ops.object.join()
@@ -1282,43 +1386,83 @@ class GLB_OT_ProcessAndExport(Operator):
                         print(f"Warning: Could not apply Smart UV Project: {e}")
                     
                     bpy.ops.object.mode_set(mode='OBJECT')
-                
-                # UV PACKING
-                if props.enable_uv_pack:
-                    self.update_progress(context, "Packing UVs...", current_idx, total_count)
+            
+            # Merge custom-UV objects into the main object BEFORE packing,
+            # so the whole collection shares one UV map -> one material
+            if custom_uv_peeled and joined_obj and joined_obj.name in bpy.data.objects:
+                if props.uv_unwrap_method == 'MOF' and not custom_bake_only:
+                    # Normalize auto-island scale BEFORE customs join in,
+                    # so the chosen layouts keep their own island proportions
                     try:
                         context.view_layer.objects.active = joined_obj
                         bpy.ops.object.select_all(action='DESELECT')
                         joined_obj.select_set(True)
-                        
                         bpy.ops.object.mode_set(mode='EDIT')
                         bpy.ops.mesh.select_all(action='SELECT')
                         bpy.ops.uv.select_all(action='SELECT')
-                        
-                        if props.uv_unwrap_method == 'MOF':
-                            bpy.ops.uv.average_islands_scale()
-                        
-                        pack_kwargs = {
-                            'margin': props.pack_margin,
-                            'rotate': props.pack_rotate,
-                            'shape_method': props.pack_shape_method,
-                            'scale': props.pack_scale,
-                            'rotate_method': props.pack_rotation_method,
-                            'margin_method': props.pack_margin_method,
-                            'pin': props.pack_lock_pinned,
-                            'pin_method': props.pack_lock_method,
-                            'merge_overlap': props.pack_merge_overlapping,
-                            'udim_source': props.pack_udim_target
-                        }
-                        bpy.ops.uv.pack_islands(**pack_kwargs)
-                        
+                        bpy.ops.uv.average_islands_scale()
                         bpy.ops.object.mode_set(mode='OBJECT')
-                        print("Packed UV islands")
                     except Exception as e:
-                        print(f"Warning: Could not pack UVs: {e}")
+                        print(f"Warning: average islands scale failed: {e}")
                         bpy.ops.object.mode_set(mode='OBJECT')
-            
-            if props.enable_baking and not custom_bake_only:
+
+                for pobj, uv_name in custom_uv_peeled:
+                    if pobj.name in bpy.data.objects:
+                        self.prepare_custom_uv_object(joined_obj, pobj, uv_name)
+                        has_custom_pinned = True
+
+                bpy.ops.object.select_all(action='DESELECT')
+                joined_obj.select_set(True)
+                context.view_layer.objects.active = joined_obj
+                for pobj, _ in custom_uv_peeled:
+                    if pobj.name in bpy.data.objects:
+                        pobj.select_set(True)
+                try:
+                    bpy.ops.object.join()
+                    joined_obj = context.active_object
+                    print("Merged custom-UV objects before packing")
+                except Exception as e:
+                    print(f"Warning: could not merge custom-UV objects: {e}")
+
+                if "UVMap" in joined_obj.data.uv_layers:
+                    joined_obj.data.uv_layers.active = joined_obj.data.uv_layers["UVMap"]
+
+            # UV PACKING - runs after customs are merged; forced on when they exist
+            if (props.uv_unwrap_method != 'NONE' and props.enable_uv_pack and not custom_bake_only) or has_custom_pinned:
+                self.update_progress(context, "Packing UVs...", current_idx, total_count)
+                try:
+                    context.view_layer.objects.active = joined_obj
+                    bpy.ops.object.select_all(action='DESELECT')
+                    joined_obj.select_set(True)
+                    
+                    bpy.ops.object.mode_set(mode='EDIT')
+                    bpy.ops.mesh.select_all(action='SELECT')
+                    bpy.ops.uv.select_all(action='SELECT')
+                    
+                    if props.uv_unwrap_method == 'MOF' and not has_custom_pinned:
+                        bpy.ops.uv.average_islands_scale()
+                    
+                    pack_kwargs = {
+                        'margin': props.pack_margin,
+                        'rotate': props.pack_rotate,
+                        'shape_method': props.pack_shape_method,
+                        'scale': props.pack_scale,
+                        'rotate_method': props.pack_rotation_method,
+                        'margin_method': props.pack_margin_method,
+                        'pin': props.pack_lock_pinned or has_custom_pinned,
+                        'pin_method': 'ROTATION' if has_custom_pinned else props.pack_lock_method,
+                        'merge_overlap': props.pack_merge_overlapping,
+                        'udim_source': props.pack_udim_target
+                    }
+                    bpy.ops.uv.pack_islands(**pack_kwargs)
+                    
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                    print("Packed UV islands")
+                except Exception as e:
+                    print(f"Warning: Could not pack UVs: {e}")
+                    bpy.ops.object.mode_set(mode='OBJECT')
+
+            if props.enable_baking:
                 original_materials = []
                 for slot in joined_obj.material_slots:
                     if slot.material:
@@ -1465,12 +1609,18 @@ class GLB_OT_ProcessAndExport(Operator):
                             if hasattr(new_mat, 'surface_render_method'):
                                 new_mat.surface_render_method = 'BLENDED'
 
+                        
                         if props.bake_ambient_occlusion:
                             print("Baking ambient occlusion...")
                             ao_image = self.create_image(f"{joined_obj.name}_AO", props.bake_resolution, 'Non-Color')
-                            self.bake_ambient_occlusion(joined_obj, ao_image)
+                            ao_part = self.bake_ao_for_joined(context, joined_obj, ao_image)
                             
                             self.create_gltf_output_node(new_mat, ao_image)
+                            
+                            if ao_part is not None:
+                                # Split-off part must end up with the same final baked material
+                                ao_part.data.materials.clear()
+                                ao_part.data.materials.append(new_mat)
                         
                         # Remove the injected Mapping nodes from the source materials.
                         # joined_obj's material slots will be replaced by new_mat below,
@@ -1519,13 +1669,13 @@ class GLB_OT_ProcessAndExport(Operator):
                         if hasattr(context.scene.cycles, attr):
                             setattr(context.scene.cycles, attr, value)
 
-            elif props.bake_ambient_occlusion and not custom_bake_only:
+            elif props.bake_ambient_occlusion:
                 # AO-only mode: keep existing materials & UV, just add baked AO
                 self.update_progress(context, f"File: {original_name} | AO-only bake", current_idx, total_count)
                 context.scene.render.engine = 'CYCLES'
                 try:
                     ao_image = self.create_image(f"{joined_obj.name}_AO", props.bake_resolution, 'Non-Color')
-                    self.bake_ambient_occlusion(joined_obj, ao_image)
+                    self.bake_ao_for_joined(context, joined_obj, ao_image)
                     for slot in joined_obj.material_slots:
                         if slot.material:
                             self.create_gltf_output_node(slot.material, ao_image)
@@ -1533,27 +1683,6 @@ class GLB_OT_ProcessAndExport(Operator):
                 except Exception as e:
                     print(f"AO-only bake failed: {e}")
                     self.report({'WARNING'}, f"AO bake failed for {original_name}: {e}")
-
-            # Merge custom-baked objects into joined_obj AFTER main bake,
-            # preserving their target UV layers
-            if custom_uv_baked_objs and joined_obj and joined_obj.name in bpy.data.objects:
-                target_uv_names = {uv_name for _, uv_name in custom_uv_baked_objs}
-                for uv_name in target_uv_names:
-                    if uv_name not in joined_obj.data.uv_layers:
-                        joined_obj.data.uv_layers.new(name=uv_name)
-
-                bpy.ops.object.select_all(action='DESELECT')
-                joined_obj.select_set(True)
-                context.view_layer.objects.active = joined_obj
-                for pobj, _ in custom_uv_baked_objs:
-                    if pobj.name in bpy.data.objects:
-                        pobj.select_set(True)
-
-                try:
-                    bpy.ops.object.join()
-                    joined_obj = context.active_object
-                except Exception as e:
-                    print(f"Warning: Could not merge custom-baked objects: {e}")
 
             progress = int((current_idx / total_count) * 100)
             context.workspace.status_text_set(
@@ -2703,7 +2832,7 @@ class GLB_OT_ProcessAndExport(Operator):
         for mat, node in temp_nodes:
             mat.node_tree.nodes.remove(node)
     
-    def bake_ambient_occlusion(self, obj, target_image):
+    def bake_ambient_occlusion(self, obj, target_image, use_clear=True):
         props = bpy.context.scene.glb_export_props
         
         temp_nodes = []
@@ -2729,12 +2858,197 @@ class GLB_OT_ProcessAndExport(Operator):
         if bpy.context.scene.world and hasattr(bpy.context.scene.world, 'light_settings'):
             bpy.context.scene.world.light_settings.distance = props.ao_distance
         
-        bpy.ops.object.bake(type='AO', use_clear=True, margin=props.bake_margin)
+        # Hide exception objects so they cast no occlusion (never hide the bake target)
+        temp_hidden = []
+        if props.ao_use_exceptions:
+            for other in bpy.context.view_layer.objects:
+                if other == obj or other.hide_render:
+                    continue
+                if other.get("ao_exception"):
+                    other.hide_render = True
+                    temp_hidden.append(other)
         
-        bpy.context.scene.cycles.samples = original_samples
+        try:
+            bpy.ops.object.bake(type='AO', use_clear=use_clear, margin=props.bake_margin)
+        finally:
+            for other in temp_hidden:
+                try:
+                    other.hide_render = False
+                except ReferenceError:
+                    pass
+            
+            bpy.context.scene.cycles.samples = original_samples
+            
+            for mat, node in temp_nodes:
+                mat.node_tree.nodes.remove(node)
+
+    def bake_ao_for_joined(self, context, joined_obj, ao_image):
+        """Bake AO for a joined object. If AO-exception geometry got joined into
+        it, split it off, bake in 2 passes, and defer the re-join until all
+        collections are done. Returns the split-off part, or None."""
+        props = context.scene.glb_export_props
         
-        for mat, node in temp_nodes:
-            mat.node_tree.nodes.remove(node)
+        part = None
+        vg = None
+        if props.ao_use_exceptions and joined_obj.type == 'MESH':
+            vg = joined_obj.vertex_groups.get("AO_EXCEPT_TMP")
+        
+        if vg is not None:
+            vg_index = vg.index
+            grouped = sum(1 for v in joined_obj.data.vertices if any(g.group == vg_index for g in v.groups))
+            total = len(joined_obj.data.vertices)
+            
+            if grouped == 0:
+                if "ao_exception" in joined_obj:
+                    del joined_obj["ao_exception"]
+            elif grouped >= total:
+                # Whole object is exception geometry - just tag it, no split needed
+                joined_obj["ao_exception"] = True
+            else:
+                # Mixed - split exception geometry into its own temporary object
+                if "ao_exception" in joined_obj:
+                    del joined_obj["ao_exception"]  # the join may have inherited the tag
+                
+                bpy.ops.object.select_all(action='DESELECT')
+                joined_obj.select_set(True)
+                context.view_layer.objects.active = joined_obj
+                joined_obj.vertex_groups.active_index = vg_index
+                
+                before = set(bpy.data.objects)
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_mode(type='VERT')
+                bpy.ops.mesh.select_all(action='DESELECT')
+                bpy.ops.object.vertex_group_select()
+                bpy.ops.mesh.separate(type='SELECTED')
+                bpy.ops.object.mode_set(mode='OBJECT')
+                
+                new_objs = [o for o in bpy.data.objects if o not in before]
+                if new_objs:
+                    part = new_objs[0]
+                    part["ao_exception"] = True
+                    part.hide_render = True  # stays hidden until the final re-join
+                    self.deferred_ao_parts.append({'main': joined_obj, 'part': part, 'uv_name': None})
+                
+                bpy.ops.object.select_all(action='DESELECT')
+                joined_obj.select_set(True)
+                context.view_layer.objects.active = joined_obj
+        
+        # Pass 1: bake main geometry (all exception objects are hidden)
+        self.bake_ambient_occlusion(joined_obj, ao_image)
+        
+        # Pass 2: bake AO onto the exception part itself (it still RECEIVES AO)
+        if part is not None:
+            part.hide_render = False
+            bpy.ops.object.select_all(action='DESELECT')
+            part.select_set(True)
+            context.view_layer.objects.active = part
+            
+            self.bake_ambient_occlusion(part, ao_image, use_clear=False)
+            
+            part.hide_render = True
+            bpy.ops.object.select_all(action='DESELECT')
+            joined_obj.select_set(True)
+            context.view_layer.objects.active = joined_obj
+        
+        return part
+
+    def prepare_custom_uv_object(self, joined_obj, pobj, uv_name):
+        """Prepare a custom-UV object for merging into the main object:
+        its chosen UV map becomes a pinned layer named 'UVMap' (the bake
+        layer), so the packer preserves its island rotation."""
+        mesh = pobj.data
+        if uv_name not in mesh.uv_layers:
+            if mesh.uv_layers.active is None:
+                return
+            uv_name = mesh.uv_layers.active.name
+        
+        # Align default-sampling layer name with the main object's render layer,
+        # so textures on this object still sample correctly after the join
+        if joined_obj is not None:
+            render_name = next((l.name for l in joined_obj.data.uv_layers if l.active_render), None)
+            if render_name and render_name != "UVMap" and render_name not in mesh.uv_layers:
+                p_render = next((l for l in mesh.uv_layers if l.active_render), None)
+                if p_render is not None:
+                    if uv_name == p_render.name:
+                        uv_name = render_name
+                    p_render.name = render_name
+        
+        # Free up the name "UVMap" for the bake layer (unless the chosen map IS "UVMap")
+        if "UVMap" in mesh.uv_layers and uv_name != "UVMap":
+            existing = [l.name for l in mesh.uv_layers]
+            n = 1
+            while f"UVMap_C{n:02d}" in existing:
+                n += 1
+            mesh.uv_layers["UVMap"].name = f"UVMap_C{n:02d}"
+        
+        if uv_name == "UVMap":
+            bake_layer = mesh.uv_layers["UVMap"]
+        else:
+            src = mesh.uv_layers[uv_name]
+            src_uvs = [0.0] * (len(mesh.loops) * 2)
+            src.data.foreach_get("uv", src_uvs)
+            bake_layer = mesh.uv_layers.new(name="UVMap", do_init=False)
+            bake_layer.data.foreach_set("uv", src_uvs)
+        
+        # Pin every UV so the packer preserves island rotation
+        for d in bake_layer.data:
+            d.pin_uv = True
+        
+        mesh.uv_layers.active = bake_layer
+
+    def merge_deferred_ao_parts(self, context):
+        """After ALL collections are baked, re-join deferred AO-exception
+        geometry into its final object and strip helper tags"""
+        props = context.scene.glb_export_props
+        
+        for entry in getattr(self, 'deferred_ao_parts', []):
+            main = entry['main']
+            part = entry['part']
+            uv_name = entry['uv_name']
+            try:
+                if not (main and main.name in bpy.data.objects):
+                    continue
+                if not (part and part.name in bpy.data.objects):
+                    continue
+            except ReferenceError:
+                continue
+            
+            try:
+                part.hide_render = False
+                
+                if uv_name:
+                    if uv_name not in main.data.uv_layers:
+                        main.data.uv_layers.new(name=uv_name)
+                else:
+                    # Split-off part: drop UV layers the main object no longer has
+                    main_uvs = {uv.name for uv in main.data.uv_layers}
+                    for name in [uv.name for uv in part.data.uv_layers]:
+                        if name not in main_uvs:
+                            part.data.uv_layers.remove(part.data.uv_layers[name])
+                
+                bpy.ops.object.select_all(action='DESELECT')
+                part.select_set(True)
+                main.select_set(True)
+                context.view_layer.objects.active = main
+                bpy.ops.object.join()
+                print(f"Merged AO-exception part back into {main.name}")
+            except Exception as e:
+                print(f"Warning: could not merge deferred AO part: {e}")
+        
+        self.deferred_ao_parts = []
+        
+        if props.ao_use_exceptions:
+            for obj in getattr(self, 'processed_objects', []):
+                try:
+                    if obj and obj.name in bpy.data.objects:
+                        if obj.type == 'MESH':
+                            vg = obj.vertex_groups.get("AO_EXCEPT_TMP")
+                            if vg:
+                                obj.vertex_groups.remove(vg)
+                        if "ao_exception" in obj:
+                            del obj["ao_exception"]
+                except ReferenceError:
+                    pass
 
     def create_gltf_output_node(self, material, ao_image, uv_map_name=None):
         """Create glTF Material Output node and connect AO"""
@@ -3187,6 +3501,28 @@ class GLB_PT_ExportPanel(Panel):
                     ao_col.prop(props, "ao_samples")
                     ao_col.prop(props, "ao_distance")
 
+                    # AO Exceptions (expandable)
+                    exc_box = col.box()
+                    row = exc_box.row()
+                    row.prop(props, "show_ao_exceptions",
+                             icon='TRIA_DOWN' if props.show_ao_exceptions else 'TRIA_RIGHT',
+                             icon_only=True, emboss=False)
+                    row.prop(props, "ao_use_exceptions")
+                    if props.show_ao_exceptions:
+                        sub = exc_box.column()
+                        sub.enabled = props.ao_use_exceptions
+                        sub.operator("glb_export.add_selected_ao_exceptions", icon='RESTRICT_SELECT_OFF')
+                        list_row = sub.row()
+                        list_row.template_list(
+                            "GLB_UL_AOExceptions", "",
+                            props, "ao_exception_objects",
+                            props, "ao_exception_index",
+                            rows=3,
+                        )
+                        btn_col = list_row.column(align=True)
+                        btn_col.operator("glb_export.add_ao_exception", icon='ADD', text="")
+                        btn_col.operator("glb_export.remove_ao_exception", icon='REMOVE', text="")
+
                 col.separator()
                 col.prop(props, "bake_resolution")
                 col.prop(props, "bake_samples")
@@ -3217,11 +3553,16 @@ class GLB_PT_ExportPanel(Panel):
 # === REGISTRATION ===
 classes = (   
     GLBBakeUVTarget,
+    GLBAOExceptionItem,
     GLBExportProperties,
     GLB_UL_CustomUVBakeTargets,
     GLB_OT_ScanCustomUVTargets,
     GLB_OT_AddCustomUVTarget,
     GLB_OT_RemoveCustomUVTarget,
+    GLB_UL_AOExceptions,
+    GLB_OT_AddAOException,
+    GLB_OT_RemoveAOException,
+    GLB_OT_AddSelectedAOExceptions,
     UPDATER_OT_check,
     UPDATER_OT_install,
     UPDATER_OT_popup,
