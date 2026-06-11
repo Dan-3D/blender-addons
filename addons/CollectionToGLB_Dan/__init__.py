@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 4, 0),
+    "version": (1, 4, 1),
     "blender": (5, 1, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -1663,7 +1663,7 @@ class GLB_OT_ProcessAndExport(Operator):
                         print("Baked materials into textures")
 
                         # After successful baking, clean up UVs
-                        if materials_use_uvs and props.uv_unwrap_method != 'NONE':
+                        if (materials_use_uvs and props.uv_unwrap_method != 'NONE') or has_custom_pinned:
                             uv_names_to_remove = []
                             for uv_layer in joined_obj.data.uv_layers:
                                 if uv_layer.name != "UVMap":
