@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (5, 1, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -189,6 +189,9 @@ class GLB_UL_AOExceptions(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
         row.prop(item, "object_ref", text="", icon='OBJECT_DATA')
+        toggles = row.row(align=True)
+        toggles.prop(item, "no_cast", text="No Cast", toggle=True)
+        toggles.prop(item, "no_receive", text="No Receive", toggle=True)
 
 
 class GLB_OT_AddAOException(Operator):
@@ -452,8 +455,18 @@ class GLBAOExceptionItem(PropertyGroup):
     object_ref: PointerProperty(
         name="Object",
         type=bpy.types.Object,
-        description="This object will not cast ambient occlusion onto other objects",
+        description="Object affected by the AO exception flags",
         poll=poll_ao_exception_object,
+    )
+    no_cast: BoolProperty(
+        name="No Cast",
+        description="This object will not darken other objects in the AO bake",
+        default=True
+    )
+    no_receive: BoolProperty(
+        name="No Receive",
+        description="This object's surface stays fully white in the AO map (receives no ambient occlusion)",
+        default=False
     )
 
 
@@ -1017,9 +1030,11 @@ class GLB_OT_ProcessAndExport(Operator):
         print("=== DUPLICATING ALL COLLECTIONS ===")
 
         props = context.scene.glb_export_props
-        ao_exception_names = set()
+        ao_exception_flags = {}
         if props.ao_use_exceptions and props.bake_ambient_occlusion:
-            ao_exception_names = {e.object_ref.name for e in props.ao_exception_objects if e.object_ref}
+            for e in props.ao_exception_objects:
+                if e.object_ref and (e.no_cast or e.no_receive):
+                    ao_exception_flags[e.object_ref.name] = (e.no_cast, e.no_receive)
         
         def hide_all_except_lighting(layer_col):
             if layer_col.collection.name != "Lighting":
@@ -1063,8 +1078,12 @@ class GLB_OT_ProcessAndExport(Operator):
                 all_duplicated_objects.append(new_obj)
                 
                 new_obj["original_name"] = obj.name
-                if obj.name in ao_exception_names:
-                    new_obj["ao_exception"] = True
+                exc_flags = ao_exception_flags.get(obj.name)
+                if exc_flags:
+                    if exc_flags[0]:
+                        new_obj["ao_exception"] = True
+                    if exc_flags[1]:
+                        new_obj["ao_no_receive"] = True
                 new_obj["original_location"] = obj.location.copy()
                 new_obj["original_rotation"] = obj.rotation_euler.copy()
                 new_obj["original_scale"] = obj.scale.copy()
@@ -1197,11 +1216,14 @@ class GLB_OT_ProcessAndExport(Operator):
         mesh_objects = [obj for obj in temp_collection.objects if obj.type == 'MESH']
         print(f"Have {len(mesh_objects)} mesh objects to process")
 
-        # Mark AO-exception geometry with a vertex group so it survives the join
+        # Mark AO-exception geometry with vertex groups so it survives the join
         if props.ao_use_exceptions and props.bake_ambient_occlusion:
             for obj in mesh_objects:
                 if obj.get("ao_exception") and "AO_EXCEPT_TMP" not in obj.vertex_groups:
                     vg = obj.vertex_groups.new(name="AO_EXCEPT_TMP")
+                    vg.add(list(range(len(obj.data.vertices))), 1.0, 'REPLACE')
+                if obj.get("ao_no_receive") and "AO_NORECV_TMP" not in obj.vertex_groups:
+                    vg = obj.vertex_groups.new(name="AO_NORECV_TMP")
                     vg.add(list(range(len(obj.data.vertices))), 1.0, 'REPLACE')
         
         # Go directly to merging vertices
@@ -1611,14 +1633,22 @@ class GLB_OT_ProcessAndExport(Operator):
 
                         
                         if props.bake_ambient_occlusion:
-                            print("Baking ambient occlusion...")
-                            ao_image = self.create_image(f"{joined_obj.name}_AO", props.bake_resolution, 'Non-Color')
-                            ao_part = self.bake_ao_for_joined(context, joined_obj, ao_image)
+                            ao_parts, main_no_cast, main_no_receive = self.prepare_ao_parts(context, joined_obj)
+                            ao_receives = (not main_no_receive) or any(not p['no_receive'] for p in ao_parts)
                             
-                            self.create_gltf_output_node(new_mat, ao_image)
+                            if ao_receives:
+                                print("Baking ambient occlusion...")
+                                ao_image = self.create_image(f"{joined_obj.name}_AO", props.bake_resolution, 'Non-Color')
+                                ao_image.generated_color = (1.0, 1.0, 1.0, 1.0)
+                                self.run_ao_bakes(context, joined_obj, ao_image, ao_parts, main_no_receive)
+                                
+                                self.create_gltf_output_node(new_mat, ao_image)
+                            else:
+                                print("All geometry is set to No Receive - skipping AO texture")
                             
-                            if ao_part is not None:
-                                # Split-off part must end up with the same final baked material
+                            for entry in ao_parts:
+                                # Split-off parts must end up with the same final baked material
+                                ao_part = entry['object']
                                 ao_part.data.materials.clear()
                                 ao_part.data.materials.append(new_mat)
                         
@@ -1674,12 +1704,19 @@ class GLB_OT_ProcessAndExport(Operator):
                 self.update_progress(context, f"File: {original_name} | AO-only bake", current_idx, total_count)
                 context.scene.render.engine = 'CYCLES'
                 try:
-                    ao_image = self.create_image(f"{joined_obj.name}_AO", props.bake_resolution, 'Non-Color')
-                    self.bake_ao_for_joined(context, joined_obj, ao_image)
-                    for slot in joined_obj.material_slots:
-                        if slot.material:
-                            self.create_gltf_output_node(slot.material, ao_image)
-                    print(f"AO-only bake complete for {joined_obj.name}")
+                    ao_parts, main_no_cast, main_no_receive = self.prepare_ao_parts(context, joined_obj)
+                    ao_receives = (not main_no_receive) or any(not p['no_receive'] for p in ao_parts)
+                    
+                    if ao_receives:
+                        ao_image = self.create_image(f"{joined_obj.name}_AO", props.bake_resolution, 'Non-Color')
+                        ao_image.generated_color = (1.0, 1.0, 1.0, 1.0)
+                        self.run_ao_bakes(context, joined_obj, ao_image, ao_parts, main_no_receive)
+                        for slot in joined_obj.material_slots:
+                            if slot.material:
+                                self.create_gltf_output_node(slot.material, ao_image)
+                        print(f"AO-only bake complete for {joined_obj.name}")
+                    else:
+                        print("All geometry is set to No Receive - skipping AO texture")
                 except Exception as e:
                     print(f"AO-only bake failed: {e}")
                     self.report({'WARNING'}, f"AO bake failed for {original_name}: {e}")
@@ -2882,62 +2919,126 @@ class GLB_OT_ProcessAndExport(Operator):
             for mat, node in temp_nodes:
                 mat.node_tree.nodes.remove(node)
 
-    def bake_ao_for_joined(self, context, joined_obj, ao_image):
-        """Bake AO for a joined object. If AO-exception geometry got joined into
-        it, split it off, bake in 2 passes, and defer the re-join until all
-        collections are done. Returns the split-off part, or None."""
+    def separate_ao_combo(self, context, joined_obj, combo, cast_idx, recv_idx):
+        """Separate the geometry matching one (no_cast, no_receive) flag
+        combination into its own temporary object. Returns it, or None."""
+        bpy.ops.object.select_all(action='DESELECT')
+        joined_obj.select_set(True)
+        context.view_layer.objects.active = joined_obj
+        
+        before = set(bpy.data.objects)
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='VERT')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        
+        bm = bmesh.from_edit_mesh(joined_obj.data)
+        deform = bm.verts.layers.deform.active
+        if deform is None:
+            bpy.ops.object.mode_set(mode='OBJECT')
+            return None
+        for v in bm.verts:
+            dv = v[deform]
+            v.select = ((cast_idx in dv, recv_idx in dv) == combo)
+        bm.select_flush(True)
+        bmesh.update_edit_mesh(joined_obj.data)
+        
+        bpy.ops.mesh.separate(type='SELECTED')
+        bpy.ops.object.mode_set(mode='OBJECT')
+        
+        new_objs = [o for o in bpy.data.objects if o not in before]
+        return new_objs[0] if new_objs else None
+
+    def prepare_ao_parts(self, context, joined_obj):
+        """Split AO-exception geometry off the joined object by behavior.
+        No Cast geometry must be hidden while other objects bake; No Receive
+        geometry is never baked (the AO image starts white, so it stays white).
+        Returns (parts, main_no_cast, main_no_receive); each part is a dict
+        {'object', 'no_cast', 'no_receive'}. Re-joins happen at the very end."""
         props = context.scene.glb_export_props
+        parts = []
+        main_no_cast = False
+        main_no_receive = False
         
-        part = None
-        vg = None
-        if props.ao_use_exceptions and joined_obj.type == 'MESH':
-            vg = joined_obj.vertex_groups.get("AO_EXCEPT_TMP")
+        if not (props.ao_use_exceptions and joined_obj.type == 'MESH'):
+            return parts, main_no_cast, main_no_receive
         
-        if vg is not None:
-            vg_index = vg.index
-            grouped = sum(1 for v in joined_obj.data.vertices if any(g.group == vg_index for g in v.groups))
-            total = len(joined_obj.data.vertices)
-            
-            if grouped == 0:
-                if "ao_exception" in joined_obj:
-                    del joined_obj["ao_exception"]
-            elif grouped >= total:
-                # Whole object is exception geometry - just tag it, no split needed
-                joined_obj["ao_exception"] = True
-            else:
-                # Mixed - split exception geometry into its own temporary object
-                if "ao_exception" in joined_obj:
-                    del joined_obj["ao_exception"]  # the join may have inherited the tag
-                
-                bpy.ops.object.select_all(action='DESELECT')
-                joined_obj.select_set(True)
-                context.view_layer.objects.active = joined_obj
-                joined_obj.vertex_groups.active_index = vg_index
-                
-                before = set(bpy.data.objects)
-                bpy.ops.object.mode_set(mode='EDIT')
-                bpy.ops.mesh.select_mode(type='VERT')
-                bpy.ops.mesh.select_all(action='DESELECT')
-                bpy.ops.object.vertex_group_select()
-                bpy.ops.mesh.separate(type='SELECTED')
-                bpy.ops.object.mode_set(mode='OBJECT')
-                
-                new_objs = [o for o in bpy.data.objects if o not in before]
-                if new_objs:
-                    part = new_objs[0]
+        vg_cast = joined_obj.vertex_groups.get("AO_EXCEPT_TMP")
+        vg_recv = joined_obj.vertex_groups.get("AO_NORECV_TMP")
+        
+        if vg_cast is None and vg_recv is None:
+            # The join may have inherited tags from one source object
+            if "ao_exception" in joined_obj:
+                del joined_obj["ao_exception"]
+            if "ao_no_receive" in joined_obj:
+                del joined_obj["ao_no_receive"]
+            return parts, main_no_cast, main_no_receive
+        
+        cast_idx = vg_cast.index if vg_cast else -1
+        recv_idx = vg_recv.index if vg_recv else -1
+        
+        # Count vertices per flag combination
+        combo_counts = {(False, False): 0, (True, False): 0, (False, True): 0, (True, True): 0}
+        for v in joined_obj.data.vertices:
+            groups = {g.group for g in v.groups}
+            combo_counts[(cast_idx in groups, recv_idx in groups)] += 1
+        
+        present = [c for c, n in combo_counts.items() if n > 0]
+        if not present:
+            return parts, main_no_cast, main_no_receive
+        
+        # The biggest chunk stays as the main object, the rest is split off
+        main_combo = max(present, key=lambda c: combo_counts[c])
+        main_no_cast, main_no_receive = main_combo
+        
+        for combo in present:
+            if combo == main_combo:
+                continue
+            part = self.separate_ao_combo(context, joined_obj, combo, cast_idx, recv_idx)
+            if part is not None:
+                nc, nr = combo
+                if nc:
                     part["ao_exception"] = True
-                    part.hide_render = True  # stays hidden until the final re-join
-                    self.deferred_ao_parts.append({'main': joined_obj, 'part': part, 'uv_name': None})
-                
-                bpy.ops.object.select_all(action='DESELECT')
-                joined_obj.select_set(True)
-                context.view_layer.objects.active = joined_obj
+                    part.hide_render = True   # casts nothing; hidden until the final re-join
+                else:
+                    part.hide_render = False  # keeps casting onto everything
+                if nr:
+                    part["ao_no_receive"] = True
+                parts.append({'object': part, 'no_cast': nc, 'no_receive': nr})
+                self.deferred_ao_parts.append({'main': joined_obj, 'part': part, 'uv_name': None})
         
-        # Pass 1: bake main geometry (all exception objects are hidden)
-        self.bake_ambient_occlusion(joined_obj, ao_image)
+        # Normalize the main object's own tags to its combo
+        if main_no_cast:
+            joined_obj["ao_exception"] = True
+        elif "ao_exception" in joined_obj:
+            del joined_obj["ao_exception"]
+        if main_no_receive:
+            joined_obj["ao_no_receive"] = True
+        elif "ao_no_receive" in joined_obj:
+            del joined_obj["ao_no_receive"]
         
-        # Pass 2: bake AO onto the exception part itself (it still RECEIVES AO)
-        if part is not None:
+        bpy.ops.object.select_all(action='DESELECT')
+        joined_obj.select_set(True)
+        context.view_layer.objects.active = joined_obj
+        
+        return parts, main_no_cast, main_no_receive
+
+    def run_ao_bakes(self, context, joined_obj, ao_image, ao_parts, main_no_receive):
+        """Bake AO onto every piece that receives it. Non-receiving geometry
+        is simply not baked - the AO image is initialized white, so its UV
+        islands stay pure white."""
+        if not main_no_receive:
+            bpy.ops.object.select_all(action='DESELECT')
+            joined_obj.select_set(True)
+            context.view_layer.objects.active = joined_obj
+            self.bake_ambient_occlusion(joined_obj, ao_image, use_clear=False)
+        
+        for entry in ao_parts:
+            if entry['no_receive']:
+                continue
+            part = entry['object']
+            if part.name not in bpy.data.objects:
+                continue
+            was_hidden = part.hide_render
             part.hide_render = False
             bpy.ops.object.select_all(action='DESELECT')
             part.select_set(True)
@@ -2945,12 +3046,11 @@ class GLB_OT_ProcessAndExport(Operator):
             
             self.bake_ambient_occlusion(part, ao_image, use_clear=False)
             
-            part.hide_render = True
-            bpy.ops.object.select_all(action='DESELECT')
-            joined_obj.select_set(True)
-            context.view_layer.objects.active = joined_obj
+            part.hide_render = was_hidden
         
-        return part
+        bpy.ops.object.select_all(action='DESELECT')
+        joined_obj.select_set(True)
+        context.view_layer.objects.active = joined_obj
 
     def prepare_custom_uv_object(self, joined_obj, pobj, uv_name):
         """Prepare a custom-UV object for merging into the main object:
@@ -3045,8 +3145,13 @@ class GLB_OT_ProcessAndExport(Operator):
                             vg = obj.vertex_groups.get("AO_EXCEPT_TMP")
                             if vg:
                                 obj.vertex_groups.remove(vg)
+                            vg = obj.vertex_groups.get("AO_NORECV_TMP")
+                            if vg:
+                                obj.vertex_groups.remove(vg)
                         if "ao_exception" in obj:
                             del obj["ao_exception"]
+                        if "ao_no_receive" in obj:
+                            del obj["ao_no_receive"]
                 except ReferenceError:
                     pass
 
