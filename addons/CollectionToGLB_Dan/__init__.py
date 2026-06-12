@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 4, 1),
+    "version": (1, 4, 2),
     "blender": (5, 1, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -798,7 +798,7 @@ class GLBExportProperties(PropertyGroup):
     bake_samples: IntProperty(
         name="Samples",
         description="Number of samples for baking",
-        default=100,
+        default=64,
         min=1,
         max=4096
     )
@@ -806,7 +806,7 @@ class GLBExportProperties(PropertyGroup):
     bake_margin: IntProperty(
         name="Margin",
         description="Baking margin in pixels",
-        default=64,
+        default=32,
         min=0,
         max=64,
         subtype='PIXEL'
@@ -942,7 +942,8 @@ class GLB_OT_ProcessAndExport(Operator):
         # recompilation when toggling engine per collection.
         self._original_engine = context.scene.render.engine
         self._original_samples = context.scene.cycles.samples
-        context.scene.render.engine = 'CYCLES'
+        if context.scene.render.engine != 'CYCLES':
+            context.scene.render.engine = 'CYCLES'
         context.scene.cycles.samples = context.scene.glb_export_props.bake_samples
         
         collection_names = [col_data['collection'].name for col_data in collections_to_process]
@@ -1506,8 +1507,6 @@ class GLB_OT_ProcessAndExport(Operator):
                     denoising_settings['use_adaptive_sampling'] = context.scene.cycles.use_adaptive_sampling
                 
                 try:
-                    context.scene.render.engine = 'CYCLES'
-                    context.scene.cycles.samples = props.bake_samples
                     
                     if hasattr(context.scene.cycles, 'use_viewport_denoising'):
                         context.scene.cycles.use_viewport_denoising = False
@@ -1702,7 +1701,6 @@ class GLB_OT_ProcessAndExport(Operator):
             elif props.bake_ambient_occlusion:
                 # AO-only mode: keep existing materials & UV, just add baked AO
                 self.update_progress(context, f"File: {original_name} | AO-only bake", current_idx, total_count)
-                context.scene.render.engine = 'CYCLES'
                 try:
                     ao_parts, main_no_cast, main_no_receive = self.prepare_ao_parts(context, joined_obj)
                     ao_receives = (not main_no_receive) or any(not p['no_receive'] for p in ao_parts)
@@ -3026,6 +3024,7 @@ class GLB_OT_ProcessAndExport(Operator):
         """Bake AO onto every piece that receives it. Non-receiving geometry
         is simply not baked - the AO image is initialized white, so its UV
         islands stay pure white."""
+        bake_uv = joined_obj.data.uv_layers.active.name if joined_obj.data.uv_layers.active else None
         if not main_no_receive:
             bpy.ops.object.select_all(action='DESELECT')
             joined_obj.select_set(True)
@@ -3043,6 +3042,8 @@ class GLB_OT_ProcessAndExport(Operator):
             bpy.ops.object.select_all(action='DESELECT')
             part.select_set(True)
             context.view_layer.objects.active = part
+            if bake_uv and bake_uv in part.data.uv_layers:
+                part.data.uv_layers.active = part.data.uv_layers[bake_uv]
             
             self.bake_ambient_occlusion(part, ao_image, use_clear=False)
             
