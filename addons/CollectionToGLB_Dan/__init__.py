@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 4, 2),
+    "version": (1, 4, 3),
     "blender": (5, 1, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -1063,6 +1063,8 @@ class GLB_OT_ProcessAndExport(Operator):
             material_mapping = {}
 
             for obj in original_collection.objects:
+                if obj.type == 'EMPTY':
+                    continue
                 new_obj = obj.copy()
                 new_obj.data = obj.data.copy()
                 
