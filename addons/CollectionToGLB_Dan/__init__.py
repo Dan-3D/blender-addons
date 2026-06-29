@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 4, 3),
+    "version": (1, 4, 4),
     "blender": (5, 1, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -1359,7 +1359,7 @@ class GLB_OT_ProcessAndExport(Operator):
             print(f"Materials use UV coordinates: {materials_use_uvs}")
 
             # Handle UV maps based on detection
-            if props.uv_unwrap_method != 'NONE' and not custom_bake_only:
+            if (props.uv_unwrap_method != 'NONE' or (props.enable_uv_pack and materials_use_uvs)) and not custom_bake_only:
                 self.update_progress(context, "UV unwrapping...", current_idx, total_count)
                 
                 if materials_use_uvs:
@@ -1453,7 +1453,7 @@ class GLB_OT_ProcessAndExport(Operator):
                     joined_obj.data.uv_layers.active = joined_obj.data.uv_layers["UVMap"]
 
             # UV PACKING - runs after customs are merged; forced on when they exist
-            if (props.uv_unwrap_method != 'NONE' and props.enable_uv_pack and not custom_bake_only) or has_custom_pinned:
+            if ((props.uv_unwrap_method != 'NONE' or materials_use_uvs) and props.enable_uv_pack and not custom_bake_only) or has_custom_pinned:
                 self.update_progress(context, "Packing UVs...", current_idx, total_count)
                 try:
                     context.view_layer.objects.active = joined_obj
@@ -1664,7 +1664,7 @@ class GLB_OT_ProcessAndExport(Operator):
                         print("Baked materials into textures")
 
                         # After successful baking, clean up UVs
-                        if (materials_use_uvs and props.uv_unwrap_method != 'NONE') or has_custom_pinned:
+                        if (materials_use_uvs and (props.uv_unwrap_method != 'NONE' or props.enable_uv_pack)) or has_custom_pinned:
                             uv_names_to_remove = []
                             for uv_layer in joined_obj.data.uv_layers:
                                 if uv_layer.name != "UVMap":
@@ -1754,6 +1754,9 @@ class GLB_OT_ProcessAndExport(Operator):
         for obj in self.processed_objects:
             try:
                 if obj and obj.name in bpy.data.objects:
+                    if obj.type != 'MESH' or len(obj.data.polygons) == 0:
+                        print(f"Skipping '{obj.name}' - no faces, not exported")
+                        continue
                     obj.select_set(True)
                     valid_objects.append(obj)
             except ReferenceError:
