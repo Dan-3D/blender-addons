@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+id = "print3dexporter"
+name = "Print3Dexporter"
+version = "1.0.71"
+tagline = "Render collections with multiple output layers using Cryptomatte"
+maintainer = "Tomas Pilat"
+type = "add-on"
+blender_version_min = "4.0.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read and write files"
