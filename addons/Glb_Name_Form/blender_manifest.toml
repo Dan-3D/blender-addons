@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+id = "glb_name_form"
+name = "GLBNameForm"
+version = "1.0.0"
+tagline = "Export active collection as GLB with structured naming convention"
+maintainer = "Popi"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read and write files"
