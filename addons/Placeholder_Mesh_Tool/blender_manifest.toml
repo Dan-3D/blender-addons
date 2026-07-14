@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+id = "placeholder_mesh_tool"
+name = "Placeholder Mesh Tool"
+version = "2.5.0"
+tagline = "Automate placeholder mesh creation for WebGL label/print previews"
+maintainer = "Popi"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read and write files"
