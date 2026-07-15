@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 4, 4),
+    "version": (1, 4, 5),
     "blender": (5, 1, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -3661,6 +3661,509 @@ class GLB_PT_ExportPanel(Panel):
             button_text = "Process & Export"
         col.operator("glb_export.process_export", text=button_text, icon='PLAY')
 
+
+# ============================================================
+#  NORMAL BAKE: HIGH -> LOW  (selected-to-active, v1.5.0)
+# ============================================================
+import numpy as _np
+from math import acos as _acos, degrees as _degrees
+
+_nbake_state = {"shell": None, "lines": {}, "pts": {}, "budget": [],
+                "stats": "", "advice": [], "counts": (0, 0)}
+_nbake_draw_handle = None
+_NBAKE_COLS = {"good": (0.1, 0.85, 0.25), "minor": (1.0, 0.65, 0.05),
+               "bad": (1.0, 0.15, 0.1), "miss": (0.6, 0.6, 0.6)}
+
+def _nbake_redraw():
+    for w in bpy.context.window_manager.windows:
+        for a in w.screen.areas:
+            if a.type == 'VIEW_3D':
+                a.tag_redraw()
+
+def _nbake_world_samples(obj, dg, limit=400):
+    ob = obj.evaluated_get(dg)
+    me = ob.to_mesh()
+    mw = ob.matrix_world
+    nmat = mw.inverted_safe().transposed().to_3x3()
+    polys, verts = me.polygons, me.vertices
+    step = max(1, len(polys) // limit)
+    out = []
+    for i in range(0, len(polys), step):
+        p = polys[i]
+        nf = (nmat @ p.normal).normalized()
+        sm = Vector((0, 0, 0))
+        for vi in p.vertices:
+            sm += verts[vi].normal
+        nsm = (nmat @ sm).normalized() if sm.length > 1e-9 else nf
+        out.append((mw @ p.center, nf, nsm))
+    ob.to_mesh_clear()
+    return out
+
+def _nbake_gather(context, limit=400):
+    p = context.scene.glb_nbake_props
+    dg = context.evaluated_depsgraph_get()
+    raw = _nbake_world_samples(p.target, dg, limit)
+    src = p.source.evaluated_get(dg)
+    inv = src.matrix_world.inverted_safe()
+    i3 = inv.to_3x3()
+    nmat = inv.transposed().to_3x3()
+    mw = src.matrix_world
+    diag = max(p.target.dimensions.length, 1e-6)
+    data = []
+    for co, nf, nsm in raw:
+        best = bd = tu = tdn = bn = None
+        for sgn in (1.0, -1.0):
+            hit, loc, nor, idx = src.ray_cast(inv @ co, (i3 @ (nf * sgn)).normalized(), distance=1.0e18)
+            if hit:
+                w = mw @ loc
+                t = (w - co).length
+                if t <= diag * 0.35:
+                    if sgn > 0: tu = t
+                    else: tdn = t
+                    if bd is None or t < bd:
+                        bd = t; best = w
+                        bn = (nmat @ nor).normalized()
+        data.append((co, nf, nsm, best, bd, tu, tdn, bn))
+    return {"data": data, "src": src, "inv": inv, "i3": i3,
+            "nmat": nmat, "mw": mw, "diag": diag}
+
+def _nbake_classify(g, ext, dist, cage):
+    src, inv, i3 = g["src"], g["inv"], g["i3"]
+    nmat, mw, diag = g["nmat"], g["mw"], g["diag"]
+    D = dist if (dist > 0.0 and not cage) else 1.0e18
+    eps = diag * 0.004
+    L = {"good": [], "minor": [], "bad": []}
+    P = {"good": [], "minor": [], "bad": [], "miss": []}
+    B = []
+    ngood = nminor = nsev = nh = nbur = nfar = noov = 0
+    for co, nf, nsm, best, bd, tu, tdn, bn in g["data"]:
+        nd = nsm if cage else nf
+        o = co + nd * ext
+        dw = -nd
+        if best is None:
+            noov += 1
+        hit, loc, nor, idx = src.ray_cast(inv @ o, (i3 @ dw).normalized(), distance=1.0e18)
+        ok = False
+        if hit:
+            wloc = mw @ loc
+            t = (wloc - o).length
+            if t <= D:
+                wn = (nmat @ nor).normalized()
+                backface = wn.dot(dw) > 0.0
+                if best is None or bn is None:
+                    k = "bad"; nsev += 1; nfar += 1
+                else:
+                    ang = _degrees(_acos(max(-1.0, min(1.0, wn.dot(bn)))))
+                    perr = (wloc - best).length
+                    if backface or ang > 25.0 or perr > diag * 0.05:
+                        k = "bad"; nsev += 1
+                        if backface and t < ext * 1.5: nbur += 1
+                        else: nfar += 1
+                    elif ang > 8.0 or perr > max(diag * 0.012, (bd or 0.0) * 0.75):
+                        k = "minor"; nminor += 1
+                    else:
+                        k = "good"; ngood += 1
+                L[k].append(o); L[k].append(wloc)
+                P[k].append(wloc + nd * eps)
+                ok = True
+        if not ok:
+            nh += 1
+            P["miss"].append(co + nd * eps)
+            bend = o + dw * (D if D < 1.0e17 else ext + diag * 0.35)
+            B.append(o); B.append(bend)
+    return {"lines": L, "pts": P, "budget": B, "g": ngood, "minor": nminor,
+            "w": nsev, "h": nh, "buried": nbur, "far": nfar, "nooverlap": noov}
+
+def _nbake_run_rays(context):
+    p = context.scene.glb_nbake_props
+    st = _nbake_state
+    st["lines"] = {}; st["pts"] = {}; st["budget"] = []; st["stats"] = ""; st["advice"] = []
+    if not (p.source and p.target and p.show_rays):
+        return
+    g = _nbake_gather(context, 400)
+    r = _nbake_classify(g, p.extrusion, p.max_ray_distance, p.use_cage)
+    st["lines"], st["pts"], st["budget"] = r["lines"], r["pts"], r["budget"]
+    tot = max(1, r["g"] + r["minor"] + r["w"] + r["h"])
+    st["stats"] = "%d clean / %d minor / %d SEVERE / %d holes" % (r["g"], r["minor"], r["w"], r["h"])
+    adv = []
+    if r["nooverlap"] > tot * 0.5:
+        adv.append(("warn", "Objects barely overlap - are they aligned?"))
+    if r["w"] == 0 and r["h"] == 0:
+        adv.append(("ok", "No severe errors - bake will look clean"))
+        if r["minor"] > 0:
+            adv.append(("info", "%d minor deviations - invisible in render" % r["minor"]))
+    else:
+        if r["h"] > 0:
+            adv.append(("warn", "Gray holes: raise Max ray distance" if not p.use_cage else "Gray holes: raise Extrusion"))
+        if r["buried"] > 0:
+            adv.append(("warn", "%d buried: RAISE Extrusion" % r["buried"]))
+        if r["far"] > 0:
+            adv.append(("warn", "%d far-grabs: LOWER Extrusion" % r["far"]))
+        if r["buried"] > 0 and r["far"] > 0:
+            adv.append(("info", "Both kinds: use Bake exploded"))
+    st["advice"] = adv
+
+def _nbake_build_shell(context):
+    p = context.scene.glb_nbake_props
+    _nbake_state["shell"] = None
+    t = p.target
+    if not (t and t.type == 'MESH'):
+        return
+    dg = context.evaluated_depsgraph_get()
+    ob = t.evaluated_get(dg)
+    me = ob.to_mesh()
+    mw = ob.matrix_world
+    nmat = mw.inverted_safe().transposed().to_3x3()
+    e = p.extrusion
+    vs = [(mw @ v.co) + (nmat @ v.normal).normalized() * e for v in me.vertices]
+    lines = []
+    step = max(1, len(me.edges) // 30000)
+    for i in range(0, len(me.edges), step):
+        a, b = me.edges[i].vertices
+        lines.append(vs[a]); lines.append(vs[b])
+    ob.to_mesh_clear()
+    if lines:
+        import gpu
+        sh = gpu.shader.from_builtin('UNIFORM_COLOR')
+        from gpu_extras.batch import batch_for_shader
+        _nbake_state["shell"] = (sh, batch_for_shader(sh, 'LINES', {"pos": lines}))
+
+def _nbake_draw_callback():
+    try:
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+        p = bpy.context.scene.glb_nbake_props
+        st = _nbake_state
+        gpu.state.blend_set('ALPHA')
+        gpu.state.depth_test_set('LESS_EQUAL')
+        sh = gpu.shader.from_builtin('UNIFORM_COLOR')
+        if p.show_shell and st.get("shell"):
+            s2, b = st["shell"]
+            gpu.state.line_width_set(1.0)
+            s2.bind(); s2.uniform_float("color", (0.2, 0.7, 1.0, 0.3))
+            b.draw(s2)
+        if st.get("budget") and p.show_rays:
+            gpu.state.line_width_set(1.0)
+            b = batch_for_shader(sh, 'LINES', {"pos": st["budget"]})
+            sh.bind(); sh.uniform_float("color", (0.85, 0.85, 0.85, 0.10))
+            b.draw(sh)
+        gpu.state.line_width_set(1.8)
+        for k in ("good", "minor", "bad"):
+            ln = st["lines"].get(k) if st.get("lines") else None
+            if ln:
+                b = batch_for_shader(sh, 'LINES', {"pos": ln})
+                sh.bind(); sh.uniform_float("color", _NBAKE_COLS[k] + (0.6,))
+                b.draw(sh)
+        for k, sz in (("miss", 4.5), ("good", 5.5), ("minor", 6.5), ("bad", 7.5)):
+            pt = st["pts"].get(k) if st.get("pts") else None
+            if pt:
+                gpu.state.point_size_set(sz)
+                b = batch_for_shader(sh, 'POINTS', {"pos": pt})
+                sh.bind(); sh.uniform_float("color", _NBAKE_COLS[k] + (1.0,))
+                b.draw(sh)
+        gpu.state.blend_set('NONE')
+        gpu.state.line_width_set(1.0)
+        gpu.state.point_size_set(1.0)
+        gpu.state.depth_test_set('NONE')
+    except Exception:
+        pass
+
+def _nbake_poll_mesh(self, obj):
+    return obj.type == 'MESH'
+
+def _nbake_eval_polycount(obj, dg):
+    ob = obj.evaluated_get(dg)
+    me = ob.to_mesh()
+    n = len(me.polygons)
+    ob.to_mesh_clear()
+    return n
+
+def _nbake_upd(self, context):
+    _nbake_build_shell(context)
+    _nbake_run_rays(context)
+    _nbake_redraw()
+
+def _nbake_upd_full(self, context):
+    _nbake_upd(self, context)
+    try:
+        dg = context.evaluated_depsgraph_get()
+        p = context.scene.glb_nbake_props
+        s = _nbake_eval_polycount(p.source, dg) if p.source else 0
+        t = _nbake_eval_polycount(p.target, dg) if p.target else 0
+        _nbake_state["counts"] = (s, t)
+    except Exception:
+        _nbake_state["counts"] = (0, 0)
+
+class GLBNormalBakeProps(PropertyGroup):
+    source: PointerProperty(type=bpy.types.Object, name="High-poly", poll=_nbake_poll_mesh, update=_nbake_upd_full)
+    target: PointerProperty(type=bpy.types.Object, name="Low-poly", poll=_nbake_poll_mesh, update=_nbake_upd_full)
+    extrusion: FloatProperty(name="Extrusion", description="How far above the surface rays start",
+                             default=0.05, min=0.0, soft_max=1.0, subtype='DISTANCE', update=_nbake_upd)
+    max_ray_distance: FloatProperty(name="Max ray distance", description="How far rays may travel (0 = unlimited)",
+                                    default=0.15, min=0.0, soft_max=3.0, subtype='DISTANCE', update=_nbake_upd)
+    use_cage: BoolProperty(name="Cage (fixes hard edges)", default=True, update=_nbake_upd)
+    show_shell: BoolProperty(name="Show ray-start shell", default=False, update=lambda s, c: _nbake_redraw())
+    show_rays: BoolProperty(name="Live ray preview", default=False, update=_nbake_upd)
+    resolution: EnumProperty(name="Resolution",
+                             items=[('512', '512', ''), ('1024', '1024', ''), ('2048', '2048', ''), ('4096', '4096', '')],
+                             default='1024')
+
+class GLB_OT_NBakeSwap(Operator):
+    bl_idname = "glb_export.nbake_swap"
+    bl_label = "Swap high/low"
+    def execute(self, context):
+        p = context.scene.glb_nbake_props
+        a, b = p.source, p.target
+        p.source = b; p.target = a
+        return {'FINISHED'}
+
+class GLB_OT_NBakeAuto(Operator):
+    bl_idname = "glb_export.nbake_auto"
+    bl_label = "Auto-set values"
+    bl_description = "Measure the gap, test candidates, keep the best-scoring values"
+    def execute(self, context):
+        p = context.scene.glb_nbake_props
+        if not (p.source and p.target):
+            self.report({'ERROR'}, "Pick high-poly and low-poly first")
+            return {'CANCELLED'}
+        g = _nbake_gather(context, 500)
+        diag = g["diag"]
+        ups = sorted([s[5] for s in g["data"] if s[5] is not None])
+        downs = sorted([s[6] for s in g["data"] if s[6] is not None])
+        if not ups and not downs:
+            self.report({'WARNING'}, "No overlap found between the two meshes")
+            return {'CANCELLED'}
+        dn95 = downs[int(0.95 * (len(downs) - 1))] if downs else 0.0
+        cands = {diag * 0.01}
+        for f in (0.5, 0.75, 0.9, 0.95):
+            v = (ups[int(f * (len(ups) - 1))] if ups else 0.0) * 1.2 + diag * 0.004
+            cands.add(min(v, diag * 0.1))
+        best = (None, None, None)
+        for ext in sorted(cands):
+            dist = ext + dn95 * 1.2 + diag * 0.006
+            r = _nbake_classify(g, ext, dist, p.use_cage)
+            score = r["g"] + 0.5 * r["minor"] - 3.0 * r["w"] - 1.5 * r["h"]
+            if best[0] is None or score > best[0]:
+                best = (score, ext, dist)
+        p.extrusion = best[1]
+        p.max_ray_distance = best[2]
+        return {'FINISHED'}
+
+class GLB_OT_NBake(Operator):
+    bl_idname = "glb_export.nbake_run"
+    bl_label = "Bake normal map"
+    bl_description = "Bake high-poly detail onto the low-poly as a tangent normal map"
+    def execute(self, context):
+        p = context.scene.glb_nbake_props
+        if not (p.source and p.target):
+            self.report({'ERROR'}, "Pick high-poly and low-poly first")
+            return {'CANCELLED'}
+        if not p.target.data.uv_layers:
+            self.report({'ERROR'}, "Low-poly has no UV map - unwrap it first")
+            return {'CANCELLED'}
+        res = int(p.resolution)
+        img_name = "%s_NormalHL" % p.target.name
+        img = bpy.data.images.get(img_name)
+        if img and (img.size[0] != res):
+            bpy.data.images.remove(img); img = None
+        if not img:
+            img = bpy.data.images.new(img_name, res, res, alpha=False, float_buffer=True)
+        img.colorspace_settings.name = 'Non-Color'
+        if p.target.material_slots and p.target.material_slots[0].material:
+            mat = p.target.material_slots[0].material
+        else:
+            mat = bpy.data.materials.new("%s_NBakeMat" % p.target.name)
+            p.target.data.materials.append(mat)
+        mat.use_nodes = True
+        nt = mat.node_tree
+        node = nt.nodes.get("NBake_Target")
+        if not node:
+            node = nt.nodes.new('ShaderNodeTexImage')
+            node.name = "NBake_Target"
+            node.label = "HL normal bake target"
+            node.location = (-600, -300)
+        node.image = img
+        for n in nt.nodes: n.select = False
+        node.select = True
+        nt.nodes.active = node
+        # unplug the target image node during bake (circular dependency guard)
+        links_backup = [(l.from_socket, l.to_socket) for out in node.outputs for l in out.links]
+        for fs, ts in links_backup:
+            for l in list(nt.links):
+                if l.from_socket == fs and l.to_socket == ts:
+                    nt.links.remove(l)
+        cage_obj = None
+        src_hide, tgt_hide = p.source.hide_get(), p.target.hide_get()
+        src_hr, tgt_hr = p.source.hide_render, p.target.hide_render
+        prev_engine = context.scene.render.engine
+        context.scene.render.engine = 'CYCLES'
+        prev_samples = context.scene.cycles.samples
+        context.scene.cycles.samples = 32
+        margin = max(8, res // 64)
+        try:
+            # hidden objects can't be selected -> temporarily unhide
+            p.source.hide_set(False); p.target.hide_set(False)
+            p.source.hide_render = False; p.target.hide_render = False
+            if context.object and context.object.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            if p.use_cage:
+                # Blender 5.x auto-cage is unreliable -> build a real cage object
+                dg = context.evaluated_depsgraph_get()
+                tgt_ev = p.target.evaluated_get(dg)
+                cage_me = bpy.data.meshes.new_from_object(tgt_ev)
+                offs = [v.co + v.normal * p.extrusion for v in cage_me.vertices]
+                for i, v in enumerate(cage_me.vertices):
+                    v.co = offs[i]
+                cage_obj = bpy.data.objects.new("NBake_TempCage", cage_me)
+                cage_obj.matrix_world = p.target.matrix_world.copy()
+                context.scene.collection.objects.link(cage_obj)
+            bpy.ops.object.select_all(action='DESELECT')
+            p.source.select_set(True)
+            p.target.select_set(True)
+            context.view_layer.objects.active = p.target
+            kwargs = dict(type='NORMAL', use_selected_to_active=True,
+                          use_cage=p.use_cage, cage_extrusion=p.extrusion,
+                          max_ray_distance=(0.0 if p.use_cage else p.max_ray_distance),
+                          normal_space='TANGENT', margin=margin, use_clear=True)
+            if cage_obj:
+                kwargs["cage_object"] = cage_obj.name
+                kwargs["cage_extrusion"] = 0.0
+            bpy.ops.object.bake(**kwargs)
+            self.report({'INFO'}, "Done - image '%s'" % img_name)
+        except Exception as ex:
+            self.report({'ERROR'}, "Bake failed: %s" % str(ex))
+            return {'CANCELLED'}
+        finally:
+            if cage_obj:
+                cme = cage_obj.data
+                bpy.data.objects.remove(cage_obj)
+                bpy.data.meshes.remove(cme)
+            for fs, ts in links_backup:
+                try: nt.links.new(fs, ts)
+                except Exception: pass
+            p.source.hide_set(src_hide); p.target.hide_set(tgt_hide)
+            p.source.hide_render = src_hr; p.target.hide_render = tgt_hr
+            context.scene.render.engine = prev_engine
+            context.scene.cycles.samples = prev_samples
+        return {'FINISHED'}
+
+def _nbake_loose_parts(me):
+    n = len(me.vertices)
+    adj = [[] for _ in range(n)]
+    for e in me.edges:
+        a, b = e.vertices
+        adj[a].append(b); adj[b].append(a)
+    seen = [False] * n
+    parts = []
+    for i in range(n):
+        if seen[i]:
+            continue
+        stack = [i]; seen[i] = True; comp = [i]
+        while stack:
+            v = stack.pop()
+            for w in adj[v]:
+                if not seen[w]:
+                    seen[w] = True
+                    stack.append(w); comp.append(w)
+        parts.append(comp)
+    return parts
+
+class GLB_OT_NBakeExploded(Operator):
+    bl_idname = "glb_export.nbake_exploded"
+    bl_label = "Bake exploded (fix contact areas)"
+    bl_description = "Fly matched part-pairs apart, bake, restore exactly - stops rays jumping between nearby parts"
+    def execute(self, context):
+        p = context.scene.glb_nbake_props
+        if not (p.source and p.target):
+            self.report({'ERROR'}, "Pick high-poly and low-poly first")
+            return {'CANCELLED'}
+        tme, sme = p.target.data, p.source.data
+        tparts = _nbake_loose_parts(tme)
+        sparts = _nbake_loose_parts(sme)
+        if len(tparts) < 2:
+            return bpy.ops.glb_export.nbake_run()
+        diag = max(p.target.dimensions.length, 1e-6)
+        tmw, smw = p.target.matrix_world, p.source.matrix_world
+        tcent = []
+        for comp in tparts:
+            c = Vector((0, 0, 0))
+            for vi in comp: c += tme.vertices[vi].co
+            tcent.append(tmw @ (c / len(comp)))
+        offs_world = [Vector((i * diag * 2.5, 0, 0)) for i in range(len(tparts))]
+        t_orig = _np.empty(len(tme.vertices) * 3, dtype=_np.float32)
+        s_orig = _np.empty(len(sme.vertices) * 3, dtype=_np.float32)
+        tme.vertices.foreach_get("co", t_orig)
+        sme.vertices.foreach_get("co", s_orig)
+        try:
+            ti = tmw.inverted_safe().to_3x3()
+            for pi, comp in enumerate(tparts):
+                lo = ti @ offs_world[pi]
+                for vi in comp:
+                    tme.vertices[vi].co += lo
+            si = smw.inverted_safe().to_3x3()
+            for comp in sparts:
+                c = Vector((0, 0, 0))
+                for vi in comp: c += sme.vertices[vi].co
+                cw = smw @ (c / len(comp))
+                bi = min(range(len(tcent)), key=lambda i: (tcent[i] - cw).length_squared)
+                lo = si @ offs_world[bi]
+                for vi in comp:
+                    sme.vertices[vi].co += lo
+            tme.update(); sme.update()
+            result = bpy.ops.glb_export.nbake_run()
+            if 'FINISHED' in result:
+                self.report({'INFO'}, "Exploded bake done (%d part pairs)" % len(tparts))
+        finally:
+            tme.vertices.foreach_set("co", t_orig)
+            sme.vertices.foreach_set("co", s_orig)
+            tme.update(); sme.update()
+            p.target.update_tag(); p.source.update_tag()
+        return {'FINISHED'}
+
+class GLB_PT_NormalBakePanel(Panel):
+    bl_label = "Normal Bake: High → Low"
+    bl_idname = "GLB_PT_normal_bake_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Col2GLB"
+    bl_options = {'DEFAULT_CLOSED'}
+    def draw(self, context):
+        p = context.scene.glb_nbake_props
+        st = _nbake_state
+        l = self.layout
+        col = l.column(align=True)
+        col.prop(p, "source")
+        col.prop(p, "target")
+        cnt = st.get("counts", (0, 0))
+        if p.source and p.target and cnt and cnt[0] and cnt[0] < cnt[1]:
+            b = l.box()
+            b.label(text="High-poly has FEWER polys than low-poly", icon='ERROR')
+            b.operator("glb_export.nbake_swap", icon='ARROW_LEFTRIGHT')
+        l.operator("glb_export.nbake_auto", icon='SHADERFX')
+        box = l.box()
+        box.prop(p, "show_shell")
+        box.prop(p, "show_rays")
+        box.prop(p, "extrusion")
+        box.prop(p, "use_cage")
+        row = box.row()
+        row.enabled = not p.use_cage
+        row.prop(p, "max_ray_distance")
+        if not p.use_cage and 0.0 < p.max_ray_distance < p.extrusion:
+            box.label(text="Distance < extrusion: rays die mid-air!", icon='ERROR')
+        if st.get("stats"):
+            l.label(text=st["stats"])
+        for kind, txt in st.get("advice", []):
+            ic = 'CHECKMARK' if kind == "ok" else ('ERROR' if kind == "warn" else 'INFO')
+            l.label(text=txt, icon=ic)
+        l.separator()
+        l.prop(p, "resolution")
+        l.operator("glb_export.nbake_run", icon='RENDER_STILL')
+        l.operator("glb_export.nbake_exploded", icon='MOD_EXPLODE')
+# ============================================================
+#  END NORMAL BAKE SECTION
+# ============================================================
+
+
 # === REGISTRATION ===
 classes = (   
     GLBBakeUVTarget,
@@ -3685,6 +4188,12 @@ classes = (
     GLB_OT_SelectImportFolder,
     GLB_OT_ProcessAndExport,
     GLB_PT_ExportPanel,
+    GLBNormalBakeProps,
+    GLB_OT_NBakeSwap,
+    GLB_OT_NBakeAuto,
+    GLB_OT_NBake,
+    GLB_OT_NBakeExploded,
+    GLB_PT_NormalBakePanel,
 )
 
 def register():
@@ -3692,6 +4201,9 @@ def register():
         bpy.utils.register_class(cls)
     
     bpy.types.Scene.glb_export_props = bpy.props.PointerProperty(type=GLBExportProperties)
+    bpy.types.Scene.glb_nbake_props = bpy.props.PointerProperty(type=GLBNormalBakeProps)
+    global _nbake_draw_handle
+    _nbake_draw_handle = bpy.types.SpaceView3D.draw_handler_add(_nbake_draw_callback, (), 'WINDOW', 'POST_VIEW')
     bpy.app.handlers.load_post.append(startup_handler)
 
     # Check for MOF resource file
@@ -3708,6 +4220,11 @@ def register():
         print("=" * 60)
 
 def unregister():
+    global _nbake_draw_handle
+    if _nbake_draw_handle:
+        bpy.types.SpaceView3D.draw_handler_remove(_nbake_draw_handle, 'WINDOW')
+        _nbake_draw_handle = None
+    del bpy.types.Scene.glb_nbake_props
     if startup_handler in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(startup_handler)
     
@@ -3718,10 +4235,3 @@ def unregister():
 
 if __name__ == "__main__":
     register()
-
-
-
-
-
-
-
