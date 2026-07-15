@@ -1,4 +1,4 @@
-schema_version = "1.0.0"
+schema_version = "1.0.71"
 id = "print3dexporter"
 name = "Print3Dexporter"
 version = "1.0.71"
