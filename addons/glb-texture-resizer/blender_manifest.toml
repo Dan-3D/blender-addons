@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+id = "glb_texture_resizer"
+name = "GLB Texture Resizer"
+version = "1.2.0"
+tagline = "Batch resize textures in GLB files"
+maintainer = "Popi (3D Content Team) + ClaudeAI"
+type = "add-on"
+blender_version_min = "3.0.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read and write files"
