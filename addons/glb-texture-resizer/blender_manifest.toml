@@ -1,4 +1,4 @@
-schema_version = "1.0.0"
+schema_version = "1.2.0"
 id = "glb_texture_resizer"
 name = "GLB Texture Resizer"
 version = "1.2.0"
