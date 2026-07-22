@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+id = "ao_node_add"
+name = "AO Node Add"
+version = "1.0.0"
+tagline = "Vytvoří node group 'glTF Material Output' se vstupem 'Occlusion' pro export glTF (AO baking)"
+maintainer = "Claude"
+type = "add-on"
+blender_version_min = "4.0.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read and write files"
