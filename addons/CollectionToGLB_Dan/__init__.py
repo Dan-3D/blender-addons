@@ -1,8 +1,8 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 4, 5),
-    "blender": (5, 1, 0),
+    "version": (1, 5, 0),
+    "blender": (5, 2, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
     "category": "Import-Export",
@@ -12,98 +12,324 @@ import bpy
 import bmesh
 import os
 import re
-import json
 import subprocess
-import threading
 import zipfile
 import tempfile
 import shutil
-import addon_utils
-import urllib.request
-import numpy as np
 from bpy.props import StringProperty, BoolProperty, IntProperty, FloatProperty, EnumProperty, CollectionProperty, PointerProperty
 from bpy.types import Panel, Operator, PropertyGroup, UIList
 from mathutils import Vector
-from bpy.props import BoolProperty
 
-GITHUB_USER = "Dan-3D"
-GITHUB_REPO = "blender-addons"
-ADDON_FOLDER = "CollectionToGLB_Dan"
-CURRENT_VERSION = (1, 1, 0)
 
-update_available = False
-latest_release_data = None
-update_checking = False
+GLB_ALPHA_MODE_ITEMS = [
+    ('BLEND', "Blend",
+     "Smooth semi-transparency and soft edges. Can show sorting artifacts where "
+     "transparent surfaces overlap. Use for glass, fades, soft gradients"),
+    ('MASK', "Mask",
+     "Hard cut-out edges: every pixel fully visible or fully invisible (threshold). "
+     "No sorting issues, faster to render. Best for hair/fur cards, foliage, fences"),
+]
 
-def get_current_version():
-    return CURRENT_VERSION
 
-def version_tuple_to_string(v):
-    return ".".join(map(str, v))
+def material_has_alpha(mat):
+    """Same alpha test the bake uses: Alpha input linked, or value below 1.0."""
+    if not mat or not mat.use_nodes or not mat.node_tree:
+        return False
+    principled = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if not principled:
+        return False
+    alpha_input = principled.inputs.get('Alpha')
+    if alpha_input is None:
+        return False
+    return alpha_input.is_linked or alpha_input.default_value < 1.0
 
-def check_for_update_background():
-    global update_available, latest_release_data, update_checking
-    update_checking = True
-    try:
-        url = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/releases"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Blender'})
-        response = urllib.request.urlopen(req, timeout=10)
-        releases = json.loads(response.read().decode())
-        
-        for release in releases:
-            tag = release.get("tag_name", "")
-            if tag.startswith(ADDON_FOLDER):
-                version_str = tag.replace(f"{ADDON_FOLDER}-v", "").replace(f"{ADDON_FOLDER}-", "")
-                try:
-                    latest_version = tuple(map(int, version_str.split(".")))
-                    if latest_version > CURRENT_VERSION:
-                        update_available = True
-                        latest_release_data = release
-                except:
-                    pass
-                break
-    except Exception as e:
-        print(f"Update check failed: {e}")
-    update_checking = False
 
-def download_and_install_update():
-    global latest_release_data
-    if not latest_release_data:
-        return False, "No update data available"
-    
-    try:
-        assets = latest_release_data.get("assets", [])
-        download_url = None
-        
-        for asset in assets:
-            if asset["name"].endswith(".zip"):
-                download_url = asset["browser_download_url"]
-                break
-        
-        if not download_url:
-            return False, "No download URL found"
-        
-        temp_path = os.path.join(bpy.app.tempdir, f"{ADDON_FOLDER}_update.zip")
-        urllib.request.urlretrieve(download_url, temp_path)
-        
-        addons_path = bpy.utils.user_resource('SCRIPTS', path="addons")
-        addon_path = os.path.join(addons_path, ADDON_FOLDER)
-        
-        bpy.ops.preferences.addon_disable(module=ADDON_FOLDER)
-        
-        if os.path.exists(addon_path):
-            shutil.rmtree(addon_path)
-        
-        with zipfile.ZipFile(temp_path, 'r') as zip_ref:
-            zip_ref.extractall(addons_path)
-        
-        os.remove(temp_path)
-        
-        bpy.ops.preferences.addon_enable(module=ADDON_FOLDER)
-        
-        return True, "Update installed! Please restart Blender."
-    except Exception as e:
-        return False, f"Update failed: {e}"
+def collection_has_alpha(coll):
+    for obj in coll.all_objects:
+        if obj.type == 'MESH':
+            for slot in obj.material_slots:
+                if material_has_alpha(slot.material):
+                    return True
+    return False
+
+
+def resolve_alpha_mode(props, collection_name):
+    """Per-collection override if listed, otherwise the global default."""
+    if collection_name:
+        for item in props.alpha_collections:
+            if item.collection_ref and item.collection_ref.name == collection_name:
+                return item.alpha_mode, item.alpha_threshold, item.double_sided
+    return props.alpha_mode, props.alpha_threshold, False
+
+
+def apply_alpha_mode(mat, mode, threshold, double_sided):
+    if mode == 'MASK':
+        mat.blend_method = 'CLIP'
+        mat.alpha_threshold = threshold
+        mat.use_backface_culling = not double_sided
+        if hasattr(mat, 'surface_render_method'):
+            mat.surface_render_method = 'DITHERED'
+        # Blender 4.2+ glTF exporter ignores blend_method and detects MASK from
+        # the nodes: insert  alpha > threshold  before the Alpha input.
+        if mat.use_nodes and mat.node_tree:
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+            principled = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+            if principled:
+                alpha_in = principled.inputs.get('Alpha')
+                if alpha_in and alpha_in.is_linked:
+                    src = alpha_in.links[0].from_socket
+                    clip = nodes.new('ShaderNodeMath')
+                    clip.operation = 'GREATER_THAN'
+                    clip.label = "Alpha Clip"
+                    clip.location = (principled.location.x - 200, principled.location.y - 300)
+                    clip.inputs[1].default_value = threshold
+                    links.remove(alpha_in.links[0])
+                    links.new(src, clip.inputs[0])
+                    links.new(clip.outputs[0], alpha_in)
+    else:
+        mat.blend_method = 'BLEND'
+        mat.use_backface_culling = not double_sided
+        if hasattr(mat, 'surface_render_method'):
+            mat.surface_render_method = 'BLENDED'
+
+_UNWRAP_RUNNING = False
+_UNWRAP_CANCEL_REQUESTED = False
+
+
+def build_mof_command(props, exe, in_path, out_path):
+    """Single source of truth for MOF parameters (used by export and Unwrap button)."""
+    cmd = [exe, in_path, out_path]
+    params = [
+        ("-RESOLUTION", str(props.bake_resolution)),
+        ("-SEPARATE", "TRUE" if props.mof_separate_hard_edges else "FALSE"),
+        ("-ASPECT", "1.0"),
+        ("-NORMALS", "TRUE" if props.mof_use_normals else "FALSE"),
+        ("-UDIMS", "1"),
+        ("-OVERLAP", "TRUE" if props.mof_overlap_identical else "FALSE"),
+        ("-MIRROR", "TRUE" if props.mof_overlap_mirrored else "FALSE"),
+        ("-WORLDSCALE", "TRUE" if props.mof_world_scale else "FALSE"),
+        ("-DENSITY", str(props.bake_resolution)),
+        ("-CENTER", "0.0", "0.0", "0.0"),
+        ("-SUPRESS", "TRUE" if props.mof_suppress_validation else "FALSE"),
+        ("-QUAD", "TRUE"),
+        ("-WELD", "FALSE"),
+        ("-FLAT", "TRUE"),
+        ("-CONE", "TRUE"),
+        ("-CONERATIO", "0.5"),
+        ("-GRIDS", "TRUE"),
+        ("-STRIP", "TRUE"),
+        ("-PATCH", "TRUE"),
+        ("-PLANES", "TRUE"),
+        ("-FLATT", "0.9"),
+        ("-MERGE", "TRUE"),
+        ("-MERGELIMIT", "0.0"),
+        ("-PRESMOOTH", "TRUE"),
+        ("-SOFTUNFOLD", "TRUE"),
+        ("-TUBES", "TRUE"),
+        ("-JUNCTIONSDEBUG", "TRUE"),
+        ("-EXTRADEBUG", "FALSE"),
+        ("-ABF", "TRUE"),
+        ("-SMOOTH", "TRUE" if props.mof_smooth else "FALSE"),
+        ("-REPAIRSMOOTH", "TRUE"),
+        ("-REPAIR", "TRUE"),
+        ("-SQUARE", "TRUE"),
+        ("-RELAX", "TRUE"),
+        ("-RELAX_ITERATIONS", "50"),
+        ("-EXPAND", "0.07"),
+        ("-CUTDEBUG", "TRUE"),
+        ("-STRETCH", "TRUE"),
+        ("-MATCH", "TRUE"),
+        ("-PACKING", "TRUE"),
+        ("-RASTERIZATION", "64"),
+        ("-PACKING_ITERATIONS", "3"),
+        ("-SCALETOFIT", "0.5"),
+        ("-VALIDATE", "FALSE"),
+    ]
+    for param in params:
+        cmd.extend(param)
+    return cmd
+
+
+def _principled_count_for_output(mat):
+    """Count Principled BSDF nodes reachable upstream from the material's
+    ACTIVE Material Output (Surface input), following links into node groups.
+    Returns (count, has_active_output)."""
+    if not mat or not mat.use_nodes or not mat.node_tree:
+        return 0, False
+    out = next((n for n in mat.node_tree.nodes
+                if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
+    if out is None:
+        return 0, False
+    counted = set()
+
+    def walk(sock, group_stack, depth):
+        if depth > 200 or sock is None:
+            return 0
+        found = 0
+        for link in sock.links:
+            node = link.from_node
+            if node.as_pointer() in counted:
+                continue
+            counted.add(node.as_pointer())
+            if node.type == 'BSDF_PRINCIPLED':
+                found += 1
+            elif node.type == 'GROUP' and node.node_tree:
+                gout = next((g for g in node.node_tree.nodes
+                             if g.type == 'GROUP_OUTPUT' and g.is_active_output), None)
+                if gout is not None:
+                    try:
+                        idx = list(node.outputs).index(link.from_socket)
+                    except ValueError:
+                        idx = 0
+                    if idx < len(gout.inputs):
+                        found += walk(gout.inputs[idx], group_stack + [node], depth + 1)
+                continue
+            elif node.type == 'GROUP_INPUT' and group_stack:
+                parent = group_stack[-1]
+                for inp in parent.inputs:
+                    found += walk(inp, group_stack[:-1], depth + 1)
+                continue
+            for inp in node.inputs:
+                found += walk(inp, group_stack, depth + 1)
+        return found
+
+    return walk(out.inputs['Surface'], [], 0), True
+
+
+def scan_export_materials(context):
+    """Pre-export check of every material in the collections that will be
+    exported. Returns a list of problem descriptions (empty = all good)."""
+    problems = []
+    colls = []
+
+    def walk_layer(layer_coll):
+        if layer_coll.exclude:
+            return
+        if layer_coll.collection.name != "Lighting":
+            colls.append(layer_coll.collection)
+        for child in layer_coll.children:
+            walk_layer(child)
+
+    for child in context.view_layer.layer_collection.children:
+        walk_layer(child)
+
+    objs_done = set()
+    mats_done = set()
+    for coll in colls:
+        for obj in coll.all_objects:
+            if obj.type != 'MESH' or obj.as_pointer() in objs_done:
+                continue
+            objs_done.add(obj.as_pointer())
+            for slot in obj.material_slots:
+                mat = slot.material
+                if not mat or mat.as_pointer() in mats_done:
+                    continue
+                mats_done.add(mat.as_pointer())
+                count, has_output = _principled_count_for_output(mat)
+                if not mat.use_nodes:
+                    problems.append(f"'{mat.name}': does not use nodes (no Principled BSDF)")
+                elif not has_output:
+                    problems.append(f"'{mat.name}': no active Material Output")
+                elif count == 0:
+                    problems.append(f"'{mat.name}': no Principled BSDF on the active Material Output")
+                elif count > 1:
+                    problems.append(f"'{mat.name}': {count} Principled BSDFs on the active Material Output")
+                elif not any(n.type == 'BSDF_PRINCIPLED' for n in mat.node_tree.nodes):
+                    problems.append(f"'{mat.name}': Principled BSDF is inside a node group "
+                                    f"(bake reads only top-level nodes)")
+    return problems
+
+
+_LAST_EXPORT_REPORT = None
+
+
+def _glb_stats(filepath):
+    """Parse a GLB file: vertex count, materials, images, max texture size."""
+    import struct, json as _json
+    with open(filepath, 'rb') as f:
+        data = f.read()
+    jlen = struct.unpack_from('<II', data, 12)[0]
+    gltf = _json.loads(data[20:20 + jlen].decode('utf-8'))
+    bin_start = 20 + jlen + 8 if len(data) > 20 + jlen + 8 else None
+
+    acc_ids = set()
+    for mesh in gltf.get('meshes', []):
+        for prim in mesh.get('primitives', []):
+            a = prim.get('attributes', {}).get('POSITION')
+            if a is not None:
+                acc_ids.add(a)
+    accessors = gltf.get('accessors', [])
+    verts = sum(accessors[a].get('count', 0) for a in acc_ids if a < len(accessors))
+
+    views = gltf.get('bufferViews', [])
+    images = gltf.get('images', [])
+    max_res = 0
+    for img in images:
+        bv = img.get('bufferView')
+        if bv is None or bin_start is None or bv >= len(views):
+            continue
+        off = bin_start + views[bv].get('byteOffset', 0)
+        chunk = data[off:off + min(views[bv].get('byteLength', 0), 4096)]
+        w = h = 0
+        if chunk[:8] == b'\x89PNG\r\n\x1a\n':
+            w, h = struct.unpack_from('>II', chunk, 16)
+        elif chunk[:2] == b'\xff\xd8':  # JPEG: find SOF marker
+            i = 2
+            while i + 9 < len(chunk):
+                if chunk[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = chunk[i + 1]
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    h, w = struct.unpack_from('>HH', chunk, i + 5)
+                    break
+                i += 2 + struct.unpack_from('>H', chunk, i + 2)[0]
+        max_res = max(max_res, w, h)
+    return {'verts': verts, 'materials': len(gltf.get('materials', [])),
+            'textures': len(images), 'max_res': max_res}
+
+
+def _store_export_report(op, time_str):
+    """Collect stats of the finished export into the session report."""
+    global _LAST_EXPORT_REPORT
+    import datetime
+    files, errors, stats = [], [], None
+    for fp in getattr(op, '_exported_files', None) or []:
+        try:
+            size_mb = os.path.getsize(fp) / (1024 * 1024)
+            files.append((os.path.basename(fp), f"{size_mb:.1f} MB"))
+            s = _glb_stats(fp)
+            if stats is None:
+                stats = s
+            else:
+                stats['verts'] += s['verts']
+                stats['materials'] += s['materials']
+                stats['textures'] += s['textures']
+                stats['max_res'] = max(stats['max_res'], s['max_res'])
+        except Exception as e:
+            errors.append(f"Could not analyze {os.path.basename(fp)}: {e}")
+    checks = None
+    if stats:
+        checks = {'verts_ok': stats['verts'] < 100000,
+                  'res_ok': stats['max_res'] <= 2048,
+                  'mats_ok': stats['materials'] <= 3}
+    _LAST_EXPORT_REPORT = {
+        'files': files,
+        'folder': bpy.path.abspath(bpy.context.scene.glb_export_props.export_path),
+        'time': time_str,
+        'collections': len(getattr(op, 'processed_objects', None) or []),
+        'stats': stats, 'checks': checks, 'errors': errors,
+        'when': datetime.datetime.now().strftime("%H:%M"),
+    }
+    print("=== EXPORT REPORT ===")
+    for n, s in files:
+        print(f"  {n}  {s}")
+    if stats:
+        verdict = "PASS" if all(checks.values()) else "NO PASS"
+        print(f"  Verts: {stats['verts']:,} | MaxTex: {stats['max_res']} | "
+              f"Textures: {stats['textures']} | Materials: {stats['materials']} | {verdict}")
+    print(f"  Time: {time_str}")
 
 
 class GLB_UL_CustomUVBakeTargets(UIList):
@@ -183,6 +409,555 @@ class GLB_OT_RemoveCustomUVTarget(Operator):
         return {'FINISHED'}
 
 
+class GLB_OT_ScanAlphaCollections(Operator):
+    bl_idname = "glb_export.scan_alpha_collections"
+    bl_label = "Scan Collections for Alpha"
+    bl_description = "Find enabled (checkboxed) collections whose materials use alpha"
+
+    def execute(self, context):
+        props = context.scene.glb_export_props
+        found = []
+
+        def walk(layer_coll):
+            if layer_coll.exclude:
+                return
+            coll = layer_coll.collection
+            if coll.name != "Lighting" and collection_has_alpha(coll):
+                found.append(coll)
+            for child in layer_coll.children:
+                walk(child)
+
+        for layer_coll in context.view_layer.layer_collection.children:
+            walk(layer_coll)
+
+        old = {item.collection_ref: (item.alpha_mode, item.alpha_threshold, item.double_sided)
+               for item in props.alpha_collections if item.collection_ref}
+        props.alpha_collections.clear()
+        for coll in found:
+            item = props.alpha_collections.add()
+            item.collection_ref = coll
+            if coll in old:
+                item.alpha_mode, item.alpha_threshold, item.double_sided = old[coll]
+
+        self.report({'INFO'}, f"Found {len(found)} collection(s) with alpha")
+        return {'FINISHED'}
+
+class GLB_OT_UnwrapSelected(Operator):
+    bl_idname = "glb_export.unwrap_selected"
+    bl_label = "Unwrap"
+    bl_description = ("Unwrap selected objects with the method and settings above. "
+                      "In Edit Mode only the selected faces are unwrapped. "
+                      "MOF runs in the background - press ESC to cancel")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    _timer = None
+    _queue = None
+    _job = None
+    _current = None
+    _in_edit = False
+    _target_names = None
+    _done_count = 0
+    _start_time = 0.0
+
+    @classmethod
+    def poll(cls, context):
+        if _UNWRAP_RUNNING:
+            return False
+        props = context.scene.glb_export_props
+        if props.uv_unwrap_method == 'NONE':
+            return False
+        if context.mode == 'EDIT_MESH':
+            return True
+        return context.mode == 'OBJECT' and any(
+            o.type == 'MESH' for o in context.selected_objects)
+
+    def _pack_uvs(self, props):
+        """Normalize + pack the currently selected UVs (must be in Edit Mode)."""
+        try:
+            bpy.ops.uv.select_all(action='SELECT')
+            bpy.ops.uv.average_islands_scale()
+            bpy.ops.uv.pack_islands(
+                margin=props.pack_margin,
+                rotate=props.pack_rotate,
+                shape_method=props.pack_shape_method,
+                scale=props.pack_scale,
+                rotate_method=props.pack_rotation_method,
+                margin_method=props.pack_margin_method,
+                pin=props.pack_lock_pinned,
+                pin_method=props.pack_lock_method,
+                merge_overlap=props.pack_merge_overlapping,
+                udim_source=props.pack_udim_target,
+            )
+        except Exception as e:
+            self.report({'WARNING'}, f"UV pack failed: {e}")
+
+    def _make_prepped_dup(self, context, obj, face_indices):
+        """Duplicate obj (selected faces only if given) and preprocess exactly
+        like the export: apply transforms, weld doubles, scale to fit 1m."""
+        dup = obj.copy()
+        dup.data = obj.data.copy()
+        context.collection.objects.link(dup)
+
+        if face_indices is not None:
+            keep = set(face_indices)
+            bm = bmesh.new()
+            bm.from_mesh(dup.data)
+            bm.faces.ensure_lookup_table()
+            del_faces = [f for f in bm.faces if f.index not in keep]
+            bmesh.ops.delete(bm, geom=del_faces, context='FACES')
+            bm.to_mesh(dup.data)
+            bm.free()
+
+        bpy.ops.object.select_all(action='DESELECT')
+        dup.select_set(True)
+        context.view_layer.objects.active = dup
+        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+        bm = bmesh.new()
+        bm.from_mesh(dup.data)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=0.00001)
+        bm.to_mesh(dup.data)
+        bm.free()
+        dup.data.update()
+
+        bbox = [dup.matrix_world @ Vector(c) for c in dup.bound_box]
+        dims = [max(c[i] for c in bbox) - min(c[i] for c in bbox) for i in range(3)]
+        max_dim = max(dims)
+        if max_dim > 0:
+            dup.scale *= (1.0 / max_dim)
+            bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+            center = [(max(c[i] for c in bbox) + min(c[i] for c in bbox)) * 0.5 / max_dim
+                      for i in range(3)]
+            dup.location[0] -= center[0]
+            dup.location[1] -= center[1]
+            dup.location[2] -= center[2]
+        return dup
+
+    def _mof_start(self, context, props, dup):
+        """Prepare dup and launch MOF in the background. Returns a job dict or None."""
+        addon_dir = os.path.dirname(os.path.realpath(__file__))
+        mof_zip_path = os.path.join(addon_dir, "resources", "MinistryOfFlat_Release.zip")
+        if not os.path.exists(mof_zip_path):
+            self.report({'ERROR'}, "MinistryOfFlat_Release.zip not found in resources folder")
+            return None
+        try:
+            extract_path = tempfile.mkdtemp(prefix="glb_mof_")
+            with zipfile.ZipFile(mof_zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_path)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to extract MOF: {e}")
+            return None
+        exe = None
+        for root, dirs, files in os.walk(extract_path):
+            for file in files:
+                if file.lower() == "unwrapconsole3.exe":
+                    exe = os.path.join(root, file)
+                    break
+            if exe:
+                break
+        if not exe:
+            self.report({'ERROR'}, "MOF executable not found in zip")
+            shutil.rmtree(extract_path, ignore_errors=True)
+            return None
+
+        bpy.ops.object.select_all(action='DESELECT')
+        dup.select_set(True)
+        context.view_layer.objects.active = dup
+
+        if props.mof_triangulate:
+            triang_mod = dup.modifiers.new(name="Triangulate", type='TRIANGULATE')
+            triang_mod.min_vertices = 5
+            triang_mod.keep_custom_normals = True
+            bpy.ops.object.modifier_apply(modifier="Triangulate")
+
+        if props.mof_separate_hard_edges:
+            bpy.ops.object.mode_set(mode='EDIT')
+            bm = bmesh.from_edit_mesh(dup.data)
+            for edge in bm.edges:
+                if not edge.smooth:
+                    edge.seam = True
+            bmesh.update_edit_mesh(dup.data)
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        temp_dir = bpy.app.tempdir
+        name_safe = dup.name.replace(" ", "_")
+        in_path = os.path.join(temp_dir, f"{name_safe}.obj")
+        out_path = os.path.join(temp_dir, f"{name_safe}_unwrapped.obj")
+        try:
+            bpy.ops.wm.obj_export(
+                filepath=in_path,
+                export_selected_objects=True,
+                export_materials=False,
+                forward_axis='Y',
+                up_axis='Z'
+            )
+        except Exception as e:
+            self.report({'ERROR'}, f"Export failed: {e}")
+            shutil.rmtree(extract_path, ignore_errors=True)
+            return None
+
+        cmd = build_mof_command(props, exe, in_path, out_path)
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        except Exception as e:
+            self.report({'ERROR'}, f"Error starting MOF: {e}")
+            shutil.rmtree(extract_path, ignore_errors=True)
+            return None
+        return {"proc": proc, "extract_path": extract_path,
+                "in_path": in_path, "out_path": out_path}
+
+    def _mof_finish(self, context, dup, job):
+        """Import the MOF result and transfer UVs onto the duplicate."""
+        if job["proc"].returncode != 0 and not os.path.exists(job["out_path"]):
+            self.report({'ERROR'}, f"MOF failed with code: {job['proc'].returncode}")
+            return False
+        try:
+            bpy.ops.wm.obj_import(filepath=job["out_path"], forward_axis='Y', up_axis='Z')
+        except Exception as e:
+            self.report({'ERROR'}, f"Import failed: {e}")
+            return False
+        imported_obj = context.active_object
+        if not (imported_obj and imported_obj.type == 'MESH'):
+            return False
+        if not dup.data.uv_layers:
+            dup.data.uv_layers.new()
+        if imported_obj.data.uv_layers and dup.data.uv_layers.active:
+            imported_obj.data.uv_layers[0].name = dup.data.uv_layers.active.name
+        context.view_layer.objects.active = dup
+        dt_mod = dup.modifiers.new(name="DataTransfer", type='DATA_TRANSFER')
+        dt_mod.object = imported_obj
+        dt_mod.use_loop_data = True
+        dt_mod.data_types_loops = {'UV'}
+        dt_mod.loop_mapping = 'TOPOLOGY'
+        bpy.ops.object.modifier_apply(modifier=dt_mod.name)
+        bpy.data.objects.remove(imported_obj, do_unlink=True)
+        return True
+
+    def _cleanup_job(self, job, kill=False):
+        if not job:
+            return
+        try:
+            if kill and job["proc"].poll() is None:
+                job["proc"].kill()
+        except Exception:
+            pass
+        for fp in (job["in_path"], job["out_path"]):
+            try:
+                if os.path.exists(fp):
+                    os.remove(fp)
+            except Exception:
+                pass
+        shutil.rmtree(job["extract_path"], ignore_errors=True)
+
+    def _remove_dup(self):
+        dup = bpy.data.objects.get(self._current["dup_name"]) if self._current else None
+        if dup:
+            mesh = dup.data
+            bpy.data.objects.remove(dup, do_unlink=True)
+            if mesh.users == 0:
+                bpy.data.meshes.remove(mesh)
+
+    def _copy_uvs_back(self, obj, dup, face_list):
+        src_layer = dup.data.uv_layers.active
+        if src_layer is None or len(dup.data.polygons) != len(face_list):
+            self.report({'WARNING'}, f"{obj.name}: topology changed, UVs not transferred")
+            return False
+        if not obj.data.uv_layers:
+            obj.data.uv_layers.new()
+        src = src_layer.data
+        dst = obj.data.uv_layers.active.data
+        for pi, dp in zip(face_list, dup.data.polygons):
+            if pi >= len(obj.data.polygons):
+                self.report({'WARNING'}, f"{obj.name}: topology changed, UVs not transferred")
+                return False
+            po = obj.data.polygons[pi]
+            if po.loop_total == dp.loop_total:
+                for k in range(po.loop_total):
+                    dst[po.loop_start + k].uv = src[dp.loop_start + k].uv
+        return True
+
+    def _start_next(self, context, props):
+        while self._queue:
+            entry = self._queue.pop(0)
+            obj = bpy.data.objects.get(entry["name"])
+            if obj is None:
+                continue
+            dup = self._make_prepped_dup(context, obj, entry["faces"])
+            job = self._mof_start(context, props, dup)
+            if job is None:
+                mesh = dup.data
+                bpy.data.objects.remove(dup, do_unlink=True)
+                if mesh.users == 0:
+                    bpy.data.meshes.remove(mesh)
+                continue
+            self._current = {"obj_name": entry["name"],
+                             "face_list": entry["faces"] if entry["faces"] is not None
+                             else list(range(len(dup.data.polygons))),
+                             "dup_name": dup.name}
+            self._job = job
+            dup.hide_set(True)
+            return True
+        return False
+
+    def _set_status(self, context):
+        import time
+        secs = int(time.time() - self._start_time)
+        name = self._current["obj_name"] if self._current else ""
+        context.workspace.status_text_set(
+            f"MOF unwrapping '{name}'... {secs}s  -  press ESC to cancel")
+
+    def _finish(self, context, cancelled):
+        global _UNWRAP_RUNNING
+        wm = context.window_manager
+        if self._timer:
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+        context.workspace.status_text_set(None)
+        _UNWRAP_RUNNING = False
+
+        props = context.scene.glb_export_props
+        bpy.ops.object.select_all(action='DESELECT')
+        first = None
+        for name in self._target_names:
+            o = bpy.data.objects.get(name)
+            if o:
+                o.select_set(True)
+                if first is None:
+                    first = o
+        if first:
+            context.view_layer.objects.active = first
+        if self._in_edit and first:
+            bpy.ops.object.mode_set(mode='EDIT')
+
+        if not cancelled and self._done_count:
+            if self._in_edit:
+                self._pack_uvs(props)
+            elif first:
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='SELECT')
+                self._pack_uvs(props)
+                bpy.ops.object.mode_set(mode='OBJECT')
+
+        for window in wm.windows:
+            for area in window.screen.areas:
+                area.tag_redraw()
+
+        if cancelled:
+            self.report({'INFO'}, "Unwrap cancelled - nothing changed on remaining objects")
+        else:
+            self.report({'INFO'}, f"MOF unwrapped {self._done_count} object(s)")
+
+    def modal(self, context, event):
+        global _UNWRAP_CANCEL_REQUESTED
+        if event.type == 'ESC' or _UNWRAP_CANCEL_REQUESTED:
+            _UNWRAP_CANCEL_REQUESTED = False
+            self._cleanup_job(self._job, kill=True)
+            self._job = None
+            self._remove_dup()
+            self._finish(context, cancelled=True)
+            return {'CANCELLED'}
+
+        if event.type == 'TIMER' and self._job:
+            if self._job["proc"].poll() is None:
+                self._set_status(context)
+                return {'PASS_THROUGH'}
+
+            dup = bpy.data.objects.get(self._current["dup_name"])
+            obj = bpy.data.objects.get(self._current["obj_name"])
+            ok = False
+            if dup and obj:
+                dup.hide_set(False)
+                ok = self._mof_finish(context, dup, self._job)
+                if ok:
+                    ok = self._copy_uvs_back(obj, dup, self._current["face_list"])
+            self._cleanup_job(self._job)
+            self._job = None
+            self._remove_dup()
+            self._current = None
+            if ok:
+                self._done_count += 1
+
+            props = context.scene.glb_export_props
+            if self._start_next(context, props):
+                self._set_status(context)
+                return {'PASS_THROUGH'}
+            self._finish(context, cancelled=False)
+            return {'FINISHED'}
+
+        return {'PASS_THROUGH'}
+
+    def execute(self, context):
+        global _UNWRAP_RUNNING, _UNWRAP_CANCEL_REQUESTED
+        _UNWRAP_CANCEL_REQUESTED = False
+        import time
+        props = context.scene.glb_export_props
+        in_edit = (context.mode == 'EDIT_MESH')
+        if in_edit:
+            targets = [o for o in context.objects_in_mode if o.type == 'MESH']
+        else:
+            targets = [o for o in context.selected_objects if o.type == 'MESH']
+        if not targets:
+            self.report({'WARNING'}, "No mesh object selected")
+            return {'CANCELLED'}
+
+        # ---------- SMART UV PROJECT (instant, unchanged) ----------
+        if props.uv_unwrap_method == 'SMART':
+            smart_kwargs = {
+                'angle_limit': props.uv_angle_limit,
+                'island_margin': props.uv_island_margin,
+                'area_weight': props.uv_area_weight,
+                'correct_aspect': props.uv_correct_aspect,
+                'scale_to_bounds': props.uv_scale_to_bounds,
+                'margin_method': props.uv_margin_method,
+                'rotate_method': props.uv_rotation_method,
+            }
+            try:
+                if in_edit:
+                    bpy.ops.uv.smart_project(**smart_kwargs)
+                else:
+                    bpy.ops.object.mode_set(mode='EDIT')
+                    bpy.ops.mesh.select_all(action='SELECT')
+                    bpy.ops.uv.smart_project(**smart_kwargs)
+                    bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception as e:
+                if not in_edit and context.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                self.report({'ERROR'}, f"Smart UV Project failed: {e}")
+                return {'CANCELLED'}
+            self.report({'INFO'}, "Smart UV unwrap done")
+            return {'FINISHED'}
+
+        # ---------- MOF: background, modal ----------
+        self._in_edit = in_edit
+        self._target_names = [o.name for o in targets]
+        self._queue = [{"name": o.name, "faces": None} for o in targets]
+        self._done_count = 0
+
+        if in_edit:
+            bpy.ops.object.mode_set(mode='OBJECT')
+            for entry in self._queue:
+                o = bpy.data.objects.get(entry["name"])
+                entry["faces"] = [p.index for p in o.data.polygons if p.select] if o else []
+            self._queue = [e for e in self._queue if e["faces"]]
+            if not self._queue:
+                bpy.ops.object.mode_set(mode='EDIT')
+                self.report({'WARNING'}, "No faces selected")
+                return {'CANCELLED'}
+
+        if not self._start_next(context, props):
+            if in_edit:
+                bpy.ops.object.mode_set(mode='EDIT')
+            return {'CANCELLED'}
+
+        self._start_time = time.time()
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(0.25, window=context.window)
+        wm.modal_handler_add(self)
+        _UNWRAP_RUNNING = True
+        self._set_status(context)
+        return {'RUNNING_MODAL'}
+
+
+class GLB_OT_UnwrapCancel(Operator):
+    bl_idname = "glb_export.unwrap_cancel"
+    bl_label = "Cancel Unwrapping"
+    bl_description = "Stop the running MOF unwrap and restore everything"
+
+    @classmethod
+    def poll(cls, context):
+        return _UNWRAP_RUNNING
+
+    def execute(self, context):
+        global _UNWRAP_CANCEL_REQUESTED
+        _UNWRAP_CANCEL_REQUESTED = True
+        return {'FINISHED'}
+
+
+class GLB_OT_HalveDouble(Operator):
+    bl_idname = "glb_export.halve_double"
+    bl_label = "Step Value"
+    bl_description = "Step to the previous / next value"
+    bl_options = {'INTERNAL'}
+
+    prop_name: StringProperty()
+    double: BoolProperty()
+
+    _caps = {
+        "bake_resolution": (256, 8192),
+        "bake_samples": (2, 1024),
+        "bake_margin": (1, 64),
+        "ao_samples": (2, 1024),
+    }
+    _float_step = {"ao_distance": 0.1}
+
+    def execute(self, context):
+        props = context.scene.glb_export_props
+        v = getattr(props, self.prop_name)
+        if self.prop_name in self._float_step:
+            st = self._float_step[self.prop_name]
+            setattr(props, self.prop_name, round(v + st if self.double else v - st, 3))
+            return {'FINISHED'}
+        lo, hi = self._caps.get(self.prop_name, (1, 1 << 20))
+        ladder, s = [], lo
+        while s <= hi:
+            ladder.append(s)
+            s *= 2
+        if self.double:
+            nv = next((x for x in ladder if x > v), hi)
+        else:
+            nv = next((x for x in reversed(ladder) if x < v), lo)
+        setattr(props, self.prop_name, nv)
+        return {'FINISHED'}
+
+
+class GLB_OT_ShowExportReport(Operator):
+    bl_idname = "glb_export.show_report"
+    bl_label = "Export Report"
+    bl_description = "Show stats of the last export in this session"
+    bl_options = {'INTERNAL'}
+
+    def invoke(self, context, event):
+        if _LAST_EXPORT_REPORT is None:
+            self.report({'INFO'}, "No export in this session yet")
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+    def draw(self, context):
+        r = _LAST_EXPORT_REPORT
+        if not r:
+            return
+        layout = self.layout
+        stats, checks = r['stats'], r['checks']
+        if checks:
+            row = layout.row()
+            all_ok = all(checks.values())
+            row.alert = not all_ok
+            row.label(text="PASS" if all_ok else "NO PASS",
+                      icon='CHECKMARK' if all_ok else 'ERROR')
+        for name, size in r['files']:
+            layout.label(text=f"{name}  -  {size}", icon='FILE')
+        if not r['files']:
+            layout.label(text="No file exported (Export was disabled)", icon='INFO')
+        layout.label(text=f"Folder: {r['folder']}")
+        layout.label(text=f"Time: {r['time']}    Collections: {r['collections']}    at {r['when']}")
+        if stats:
+            box = layout.box()
+            def line(txt, ok):
+                row = box.row()
+                row.alert = not ok
+                row.label(text=txt, icon='CHECKMARK' if ok else 'X')
+            line(f"Vertices: {stats['verts']:,}", checks['verts_ok'])
+            line(f"Max texture: {stats['max_res']}", checks['res_ok'])
+            line(f"Textures: {stats['textures']}", True)
+            line(f"Materials: {stats['materials']}", checks['mats_ok'])
+        for e in r['errors']:
+            layout.label(text=e, icon='ERROR')
+
+
 class GLB_UL_AOExceptions(UIList):
     bl_idname = "GLB_UL_AOExceptions"
 
@@ -241,102 +1016,6 @@ class GLB_OT_AddSelectedAOExceptions(Operator):
                 added += 1
         self.report({'INFO'}, f"Added {added} object(s) to AO exceptions")
         return {'FINISHED'}
-
-
-class UPDATER_OT_check(bpy.types.Operator):
-    bl_idname = "updater.check_update"
-    bl_label = "Check for Updates"
-    bl_description = "Check GitHub for addon updates"
-    
-    def execute(self, context):
-        global update_available, update_checking
-        
-        if update_checking:
-            self.report({'INFO'}, "Already checking for updates...")
-            return {'FINISHED'}
-        
-        update_available = False
-        thread = threading.Thread(target=check_for_update_background)
-        thread.start()
-        thread.join(timeout=15)
-        
-        if update_available:
-            self.report({'INFO'}, "Update available!")
-        else:
-            self.report({'INFO'}, "You have the latest version")
-        
-        return {'FINISHED'}
-
-
-class UPDATER_OT_install(bpy.types.Operator):
-    bl_idname = "updater.install_update"
-    bl_label = "Install Update"
-    bl_description = "Download and install the latest version"
-    
-    def execute(self, context):
-        success, message = download_and_install_update()
-        if success:
-            self.report({'INFO'}, message)
-        else:
-            self.report({'ERROR'}, message)
-        return {'FINISHED'}
-
-
-class UPDATER_OT_popup(bpy.types.Operator):
-    bl_idname = "updater.update_popup"
-    bl_label = "Update Available"
-    
-    def execute(self, context):
-        return {'FINISHED'}
-    
-    def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self, width=300)
-    
-    def draw(self, context):
-        layout = self.layout
-        layout.label(text=f"{ADDON_FOLDER} update available!", icon='INFO')
-        layout.label(text=f"Current: v{version_tuple_to_string(CURRENT_VERSION)}")
-        if latest_release_data:
-            tag = latest_release_data.get("tag_name", "")
-            layout.label(text=f"Latest: {tag}")
-        layout.separator()
-        layout.operator("updater.install_update", text="Install Update", icon='IMPORT')
-
-
-class UPDATER_PT_panel(bpy.types.Panel):
-    bl_label = "Addon Updates"
-    bl_idname = "UPDATER_PT_panel"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "Col2GLB"
-    bl_options = {'DEFAULT_CLOSED'}
-    
-    def draw(self, context):
-        layout = self.layout
-        layout.label(text=f"Version: {version_tuple_to_string(CURRENT_VERSION)}")
-        
-        if update_checking:
-            layout.label(text="Checking for updates...", icon='TIME')
-        elif update_available:
-            layout.label(text="Update available!", icon='ERROR')
-            layout.operator("updater.install_update", icon='IMPORT')
-        else:
-            layout.operator("updater.check_update", icon='FILE_REFRESH')
-
-def check_update_on_startup():
-    thread = threading.Thread(target=check_for_update_background)
-    thread.start()
-    return None
-
-def show_update_popup():
-    if update_available:
-        bpy.ops.updater.update_popup('INVOKE_DEFAULT')
-    return None
-
-@bpy.app.handlers.persistent
-def startup_handler(dummy):
-    bpy.app.timers.register(check_update_on_startup, first_interval=3.0)
-    bpy.app.timers.register(show_update_popup, first_interval=8.0)
 
 def delayed_cleanup(cleanup_data):
     """Cleanup function that runs after a delay to avoid preview job crashes"""
@@ -408,6 +1087,9 @@ def update_uv_method(self, context):
     if self.uv_unwrap_method == 'MOF':
         self.enable_uv_pack = True
         self.show_packing_settings = True
+    # Auto-disable packing when no unwrap method (user can re-enable)
+    elif self.uv_unwrap_method == 'NONE':
+        self.enable_uv_pack = False
 
 # === PROPERTY GROUPS ===
 
@@ -468,6 +1150,17 @@ class GLBAOExceptionItem(PropertyGroup):
         description="This object's surface stays fully white in the AO map (receives no ambient occlusion)",
         default=False
     )
+
+
+class GLBAlphaCollectionItem(PropertyGroup):
+    collection_ref: PointerProperty(type=bpy.types.Collection, name="Collection")
+    alpha_mode: EnumProperty(name="Alpha Mode", items=GLB_ALPHA_MODE_ITEMS, default='BLEND')
+    alpha_threshold: FloatProperty(
+        name="Threshold", default=0.5, min=0.0, max=1.0,
+        description="Mask cutoff: pixels with alpha above this are visible, below are invisible")
+    double_sided: BoolProperty(
+        name="Double Sided", default=False,
+        description="Render both sides of faces (needed for fur/foliage cards)")
 
 
 class GLBExportProperties(PropertyGroup):
@@ -625,6 +1318,26 @@ class GLBExportProperties(PropertyGroup):
         description="Show/hide packing settings",
         default=False
     )
+
+    show_mof_settings: BoolProperty(
+        name="Show MOF Settings",
+        default=False
+    )
+
+    show_smart_settings: BoolProperty(
+        name="Show Smart UV Settings",
+        default=False
+    )
+
+    show_import_blend: BoolProperty(
+        name="Show Import Blend Files",
+        default=False
+    )
+
+    show_alpha_mode: BoolProperty(
+        name="Show Alpha Mode Settings",
+        default=False
+    )
     
     enable_uv_pack: BoolProperty(
         name="Pack UVs",
@@ -632,28 +1345,44 @@ class GLBExportProperties(PropertyGroup):
         default=True,
         update=update_uv_pack
     )
-    
-    enable_uv_pack: BoolProperty(
-        name="Pack UVs",
-        description="Pack UV islands after unwrapping",
-        default=True,
-    )
+
     enable_custom_uv_bake: BoolProperty(
         name="Enable Custom UV Bake",
         description="Bake specific objects to a chosen UV map instead of the global UV method",
         default=False,
     )
+
     show_custom_uv_bake: BoolProperty(
         name="Show Custom UV Bake Settings",
         default=True,
     )
+
     custom_uv_bake_targets: CollectionProperty(
         type=GLBBakeUVTarget,
     )
+
     custom_uv_bake_index: IntProperty(
         name="Active Target Index",
         default=0,
     )
+
+    alpha_mode: EnumProperty(
+        name="Alpha Mode",
+        description="Default alpha mode for baked materials with transparency (per-collection overrides in the list)",
+        items=GLB_ALPHA_MODE_ITEMS,
+        default='BLEND',
+    )
+
+    alpha_threshold: FloatProperty(
+        name="Threshold", default=0.5, min=0.0, max=1.0,
+        description="Mask cutoff: pixels with alpha above this are visible, below are invisible",
+    )
+    
+    alpha_collections: CollectionProperty(type=GLBAlphaCollectionItem)
+    export_running: BoolProperty(default=False, options={'SKIP_SAVE'})
+    export_progress: FloatProperty(default=0.0, min=0.0, max=1.0,
+                                   subtype='FACTOR', options={'SKIP_SAVE'})
+    export_status: StringProperty(default="", options={'SKIP_SAVE'})
 
     pack_shape_method: EnumProperty(
         name="Shape Method",
@@ -791,8 +1520,8 @@ class GLBExportProperties(PropertyGroup):
         description="Texture resolution for baking",
         default=2048,
         min=128,
-        max=8192,
-        soft_max=4096
+        max=16384,
+        soft_max=8192
     )
 
     bake_samples: IntProperty(
@@ -886,7 +1615,7 @@ class GLB_OT_ProcessAndExport(Operator):
     """Process selected collections"""
     bl_idname = "glb_export.process_export"
     bl_label = "Process and Export"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = {'INTERNAL'}
     
     _timer = None
     _current_collection = 0
@@ -894,7 +1623,29 @@ class GLB_OT_ProcessAndExport(Operator):
     _collections_to_process = []
     _is_cancelled = False
     
+    def invoke(self, context, event):
+        self._material_problems = scan_export_materials(context)
+        if self._material_problems:
+            return context.window_manager.invoke_props_dialog(self, width=460)
+        return self.execute(context)
+
+    def draw(self, context):
+        problems = getattr(self, '_material_problems', None)
+        if not problems:
+            return
+        layout = self.layout
+        layout.label(text="Material problems found:", icon='ERROR')
+        box = layout.box()
+        for msg in self._material_problems[:14]:
+            box.label(text=msg)
+        if len(self._material_problems) > 14:
+            box.label(text=f"...and {len(self._material_problems) - 14} more")
+        layout.label(text="OK = continue export anyway.   ESC or click outside = cancel.")
+
     def execute(self, context):
+        import time as _time
+        self._t_start = _time.time()
+        self._exported_files = []
         collections_to_process = []
         
         self.original_exclude_states = {}
@@ -962,14 +1713,17 @@ class GLB_OT_ProcessAndExport(Operator):
     
     def update_progress(self, context, message, current=None, total=None):
         """Update progress with fallback to console"""
-        # Try to set status text in UI
+        props = context.scene.glb_export_props
         try:
             if current and total:
                 progress = int((current / total) * 100)
                 full_message = f"[{current}/{total}] {progress}% - {message}"
             else:
                 full_message = message
+            props.export_status = message
             context.workspace.status_text_set(full_message)
+            for area in context.screen.areas:
+                area.tag_redraw()
         except:
             pass  # Status text not available in this context
         
@@ -987,6 +1741,10 @@ class GLB_OT_ProcessAndExport(Operator):
         
         if event.type == 'TIMER':
             if self._phase == "DUPLICATING":
+                props = context.scene.glb_export_props
+                props.export_running = True
+                props.export_progress = 0.0
+                props.export_status = "Preparing collections..."
                 self.duplicate_all_collections(context)
                 self._phase = "PROCESSING"
                 self._current_collection = 0
@@ -1002,18 +1760,46 @@ class GLB_OT_ProcessAndExport(Operator):
                                 f"BATCH PROCESSING | {self._current_collection + 1} of {self._total_collections} files | {progress}% | "
                                 f"File: {collection_name} | Material: PROCESSING"
                             )
+                            props_ui = context.scene.glb_export_props
+                            props_ui.export_progress = self._current_collection / self._total_collections
+                            props_ui.export_status = (
+                                f"{int(100 * self._current_collection / self._total_collections)}%  "
+                                f"({self._current_collection + 1}/{self._total_collections})  {collection_name}")
+                            for area in context.screen.areas:
+                                area.tag_redraw()
                             
                             try:
-                                processed_obj = self.process_temp_collection(
-                                    context, 
-                                    temp_col['collection'],
-                                    collection_name,
-                                    self._current_collection + 1, 
-                                    self._total_collections
-                                )
-                                if processed_obj:
-                                    self.processed_objects.append(processed_obj)
+                                if getattr(self, '_col_gen', None) is None:
+                                    self._col_gen = self.process_temp_collection(
+                                        context, 
+                                        temp_col['collection'],
+                                        collection_name,
+                                        self._current_collection + 1, 
+                                        self._total_collections
+                                    )
+                                try:
+                                    next(self._col_gen)
+                                    # MOF running in background - keep UI alive,
+                                    # stay on this collection until it finishes
+                                    context.workspace.status_text_set(
+                                        f"MOF unwrapping '{collection_name}' in background - ESC to cancel")
+                                    props_bar = context.scene.glb_export_props
+                                    if hasattr(props_bar, "export_status"):
+                                        props_bar.export_status = f"MOF: {collection_name}  (ESC to cancel)"
+                                        for area in context.screen.areas:
+                                            area.tag_redraw()
+                                    return {'PASS_THROUGH'}
+                                except StopIteration as stop:
+                                    self._col_gen = None
+                                    processed_obj = stop.value
+                                    if processed_obj:
+                                        self.processed_objects.append(processed_obj)
                             except Exception as e:
+                                self._col_gen = None
+                                job = getattr(self, '_mof_job', None)
+                                if job:
+                                    GLB_OT_UnwrapSelected._cleanup_job(self, job, kill=True)
+                                    self._mof_job = None
                                 self.report({'WARNING'}, f"Failed to process {collection_name}: {str(e)}")
                             break
                     
@@ -1022,6 +1808,28 @@ class GLB_OT_ProcessAndExport(Operator):
                     self.merge_deferred_ao_parts(context)
                     if self.processed_objects and context.scene.glb_export_props.export_enabled:
                         self.export_combined_glb(context)
+                    props_done = context.scene.glb_export_props
+                    props_done.export_progress = 1.0
+                    import time as _time
+                    _el = int(_time.time() - getattr(self, '_t_start', _time.time()))
+                    _t_str = f"{_el // 60}m {_el % 60}s" if _el >= 60 else f"{_el}s"
+                    props_done.export_status = f"100%  Finished in {_t_str}"
+                    self.report({'INFO'}, f"Export finished in {_t_str}")
+                    for area in context.screen.areas:
+                        area.tag_redraw()
+
+                    def _hide_export_bar():
+                        try:
+                            bpy.context.scene.glb_export_props.export_running = False
+                            for w in bpy.context.window_manager.windows:
+                                for a in w.screen.areas:
+                                    a.tag_redraw()
+                        except Exception:
+                            pass
+                        return None
+                    bpy.app.timers.register(_hide_export_bar, first_interval=0.5)
+                    _store_export_report(self, _t_str)
+                    bpy.ops.glb_export.show_report('INVOKE_DEFAULT')
                     self.finish(context)
                     return {'FINISHED'}
         
@@ -1199,9 +2007,6 @@ class GLB_OT_ProcessAndExport(Operator):
         
         print(f"\n=== PROCESSING COLLECTION: {original_name} ===")
         
-        wm = context.window_manager
-        collection_lights = []
-        
         # Remove lights and empties
         objects_to_remove = []
         for obj in temp_collection.objects:
@@ -1272,6 +2077,7 @@ class GLB_OT_ProcessAndExport(Operator):
             custom_uv_peeled = []
             custom_bake_only = False
             has_custom_pinned = False
+            single_custom_only = False
             if props.enable_custom_uv_bake and len(props.custom_uv_bake_targets) > 0:
                 target_map = {}
                 for t in props.custom_uv_bake_targets:
@@ -1302,6 +2108,7 @@ class GLB_OT_ProcessAndExport(Operator):
                     if not remaining and custom_uv_peeled:
                         custom_bake_only = True
                         has_custom_pinned = True
+                        single_custom_only = len(custom_uv_peeled) == 1
                         for pobj, uv_name in custom_uv_peeled:
                             self.prepare_custom_uv_object(None, pobj, uv_name)
                         bpy.ops.object.select_all(action='DESELECT')
@@ -1365,14 +2172,7 @@ class GLB_OT_ProcessAndExport(Operator):
                 if materials_use_uvs:
                     print("Materials use UV coordinates - preserving for baking")
                     
-                    existing_uv_names = [uv.name for uv in joined_obj.data.uv_layers]
-                    if "UVMap" in existing_uv_names:
-                        suffix_num = 1
-                        while f"UVMap_{suffix_num:02d}" in existing_uv_names:
-                            suffix_num += 1
-                        joined_obj.data.uv_layers["UVMap"].name = f"UVMap_{suffix_num:02d}"
-                    
-                    new_uv = joined_obj.data.uv_layers.new(name="UVMap")
+                    new_uv = joined_obj.data.uv_layers.new(name="GLB_Bake")
                     joined_obj.data.uv_layers.active = new_uv
                     
                 else:
@@ -1386,10 +2186,23 @@ class GLB_OT_ProcessAndExport(Operator):
                 
                 # NOW APPLY THE UNWRAPPING (only once, to the active UV layer)
                 if props.uv_unwrap_method == 'MOF':
-                    if self.apply_mof_unwrap(context, joined_obj):
-                        print("Applied MOF UV Unwrap")
+                    # MOF runs as a background process; each yield returns
+                    # control to the UI so Blender stays responsive and
+                    # ESC can cancel during the unwrap
+                    job = GLB_OT_UnwrapSelected._mof_start(self, context, props, joined_obj)
+                    if job is None:
+                        print("Warning: MOF unwrap failed to start, skipping UV unwrap")
                     else:
-                        print("Warning: MOF unwrap failed, skipping UV unwrap")
+                        self._mof_job = job
+                        while job["proc"].poll() is None:
+                            yield 'MOF_WAIT'
+                        self._mof_job = None
+                        ok = GLB_OT_UnwrapSelected._mof_finish(self, context, joined_obj, job)
+                        GLB_OT_UnwrapSelected._cleanup_job(self, job)
+                        if ok:
+                            print("Applied MOF UV Unwrap")
+                        else:
+                            print("Warning: MOF unwrap failed, skipping UV unwrap")
                 
                 elif props.uv_unwrap_method == 'SMART':
                     bpy.ops.object.mode_set(mode='EDIT')
@@ -1449,11 +2262,13 @@ class GLB_OT_ProcessAndExport(Operator):
                 except Exception as e:
                     print(f"Warning: could not merge custom-UV objects: {e}")
 
-                if "UVMap" in joined_obj.data.uv_layers:
+                if "GLB_Bake" in joined_obj.data.uv_layers:
+                    joined_obj.data.uv_layers.active = joined_obj.data.uv_layers["GLB_Bake"]
+                elif "UVMap" in joined_obj.data.uv_layers:
                     joined_obj.data.uv_layers.active = joined_obj.data.uv_layers["UVMap"]
 
             # UV PACKING - runs after customs are merged; forced on when they exist
-            if ((props.uv_unwrap_method != 'NONE' or materials_use_uvs) and props.enable_uv_pack and not custom_bake_only) or has_custom_pinned:
+            if ((props.uv_unwrap_method != 'NONE' or materials_use_uvs) and props.enable_uv_pack and not custom_bake_only) or (has_custom_pinned and not single_custom_only):
                 self.update_progress(context, "Packing UVs...", current_idx, total_count)
                 try:
                     context.view_layer.objects.active = joined_obj
@@ -1524,6 +2339,7 @@ class GLB_OT_ProcessAndExport(Operator):
                     materials = [slot.material for slot in joined_obj.material_slots if slot.material]
                     
                     if materials:
+                        uv_state = self.begin_uv_safe_bake(joined_obj, materials)
                         bake_data = self.analyze_materials(materials)
                         
                         self.prepare_materials_for_baking(materials, bake_data)
@@ -1627,10 +2443,8 @@ class GLB_OT_ProcessAndExport(Operator):
                             # Force backface culling so glTF exports doubleSided=False, otherwise
                             # back faces render through front faces in BLEND mode and look like
                             # ghost transparency on actually-opaque areas of the texture.
-                            new_mat.blend_method = 'BLEND'
-                            new_mat.use_backface_culling = True
-                            if hasattr(new_mat, 'surface_render_method'):
-                                new_mat.surface_render_method = 'BLENDED'
+                            a_mode, a_thr, a_ds = resolve_alpha_mode(props, original_name)
+                            apply_alpha_mode(new_mat, a_mode, a_thr, a_ds)
 
                         
                         if props.bake_ambient_occlusion:
@@ -1657,6 +2471,7 @@ class GLB_OT_ProcessAndExport(Operator):
                         # joined_obj's material slots will be replaced by new_mat below,
                         # but the source materials still live in bpy.data.materials.
                         self.remove_coord_compensation(coord_splices)
+                        self.end_uv_safe_bake(joined_obj, uv_state)
                         
                         joined_obj.data.materials.clear()
                         joined_obj.data.materials.append(new_mat)
@@ -1665,14 +2480,16 @@ class GLB_OT_ProcessAndExport(Operator):
 
                         # After successful baking, clean up UVs
                         if (materials_use_uvs and (props.uv_unwrap_method != 'NONE' or props.enable_uv_pack)) or has_custom_pinned:
-                            uv_names_to_remove = []
-                            for uv_layer in joined_obj.data.uv_layers:
-                                if uv_layer.name != "UVMap":
-                                    uv_names_to_remove.append(uv_layer.name)
+                            keep_name = joined_obj.data.uv_layers.active.name if joined_obj.data.uv_layers.active else None
                             
+                            uv_names_to_remove = [uv.name for uv in joined_obj.data.uv_layers
+                                                  if uv.name != keep_name]
                             for uv_name in uv_names_to_remove:
                                 if uv_name in joined_obj.data.uv_layers:
                                     joined_obj.data.uv_layers.remove(joined_obj.data.uv_layers[uv_name])
+                            
+                            if keep_name and keep_name in joined_obj.data.uv_layers:
+                                joined_obj.data.uv_layers[keep_name].name = "UVMap"
                             
                             print("Cleaned up UV maps after baking")
 
@@ -1685,6 +2502,11 @@ class GLB_OT_ProcessAndExport(Operator):
                     # If a bake threw mid-way, clean up any Mapping splices we injected
                     try:
                         self.remove_coord_compensation(coord_splices)
+                    except (NameError, Exception):
+                        pass
+
+                    try:
+                        self.end_uv_safe_bake(joined_obj, uv_state)
                     except (NameError, Exception):
                         pass
                     
@@ -1782,6 +2604,7 @@ class GLB_OT_ProcessAndExport(Operator):
             )
             print(f"Exported: {filepath}")
             self.report({'INFO'}, f"Exported: {filename}")
+            self._exported_files.append(filepath)
         except Exception as e:
             print(f"Failed to export: {str(e)}")
             self.report({'WARNING'}, f"Failed to export: {str(e)}")
@@ -1794,6 +2617,18 @@ class GLB_OT_ProcessAndExport(Operator):
             context.view_layer.objects.active = original_active
 
     def cancel(self, context):
+        # Kill a background MOF process if one is running
+        try:
+            job = getattr(self, '_mof_job', None)
+            if job:
+                GLB_OT_UnwrapSelected._cleanup_job(self, job, kill=True)
+                self._mof_job = None
+            gen = getattr(self, '_col_gen', None)
+            if gen:
+                gen.close()
+                self._col_gen = None
+        except Exception:
+            pass
         # Restore engine/samples to what they were before the export started
         if hasattr(self, '_original_engine'):
             context.scene.render.engine = self._original_engine
@@ -1810,6 +2645,7 @@ class GLB_OT_ProcessAndExport(Operator):
                     pass
         
         context.workspace.status_text_set(None)
+        context.scene.glb_export_props.export_running = False
         self.report({'WARNING'}, 'Processing cancelled - cleanup scheduled')
         
         # Prepare data for delayed cleanup
@@ -1853,207 +2689,6 @@ class GLB_OT_ProcessAndExport(Operator):
         
         # Schedule cleanup after 2 seconds to let preview jobs finish
         bpy.app.timers.register(delayed_cleanup(cleanup_data), first_interval=1.5)
-    
-    def apply_mof_unwrap(self, context, obj):
-        """Apply Ministry of Flat UV unwrapping to an object"""
-        props = context.scene.glb_export_props
-        
-        # Get addon directory and MOF zip path
-        addon_dir = os.path.dirname(os.path.realpath(__file__))
-        mof_zip_path = os.path.join(addon_dir, "resources", "MinistryOfFlat_Release.zip")
-        
-        if not os.path.exists(mof_zip_path):
-            self.report({'ERROR'}, "MinistryOfFlat_Release.zip not found in resources folder")
-            return False
-        
-        # Extract MOF executable
-        try:
-            extract_path = tempfile.mkdtemp(prefix="glb_mof_")
-            with zipfile.ZipFile(mof_zip_path, 'r') as zip_ref:
-                zip_ref.extractall(extract_path)
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to extract MOF: {e}")
-            return False
-        
-        # Find the executable
-        exe = None
-        for root, dirs, files in os.walk(extract_path):
-            for file in files:
-                if file.lower() == "unwrapconsole3.exe":
-                    exe = os.path.join(root, file)
-                    break
-            if exe:
-                break
-        
-        if not exe:
-            self.report({'ERROR'}, "MOF executable not found in zip")
-            shutil.rmtree(extract_path)
-            return False
-        
-        # Store original selection and mode
-        original_mode = bpy.context.mode
-        
-        # Select only our object
-        bpy.ops.object.select_all(action='DESELECT')
-        obj.select_set(True)
-        context.view_layer.objects.active = obj
-        
-        # Triangulate if needed
-        if props.mof_triangulate:
-            bpy.ops.object.mode_set(mode='OBJECT')
-            triang_mod = obj.modifiers.new(name="Triangulate", type='TRIANGULATE')
-            triang_mod.min_vertices = 5
-            triang_mod.keep_custom_normals = True
-            bpy.ops.object.modifier_apply(modifier="Triangulate")
-        
-        # Apply hard edge seams if needed
-        if props.mof_separate_hard_edges:
-            bpy.ops.object.mode_set(mode='EDIT')
-            bm = bmesh.from_edit_mesh(obj.data)
-            for edge in bm.edges:
-                if not edge.smooth:  # Sharp edge
-                    edge.seam = True
-            bmesh.update_edit_mesh(obj.data)
-            bpy.ops.object.mode_set(mode='OBJECT')
-        
-        # Export to OBJ
-        temp_dir = bpy.app.tempdir
-        name_safe = obj.name.replace(" ", "_")
-        in_path = os.path.join(temp_dir, f"{name_safe}.obj")
-        out_path = os.path.join(temp_dir, f"{name_safe}_unwrapped.obj")
-        
-        try:
-            bpy.ops.wm.obj_export(
-                filepath=in_path,
-                export_selected_objects=True,
-                export_materials=False,
-                forward_axis='Y',
-                up_axis='Z'
-            )
-        except Exception as e:
-            self.report({'ERROR'}, f"Export failed: {e}")
-            shutil.rmtree(extract_path)
-            return False
-        
-        # Build MOF command with all parameters
-        cmd = [exe, in_path, out_path]
-        params = [
-            ("-RESOLUTION", str(props.bake_resolution)),
-            ("-SEPARATE", "TRUE" if props.mof_separate_hard_edges else "FALSE"),
-            ("-ASPECT", "1.0"),
-            ("-NORMALS", "TRUE" if props.mof_use_normals else "FALSE"),
-            ("-UDIMS", "1"),
-            ("-OVERLAP", "TRUE" if props.mof_overlap_identical else "FALSE"),
-            ("-MIRROR", "TRUE" if props.mof_overlap_mirrored else "FALSE"),
-            ("-WORLDSCALE", "TRUE" if props.mof_world_scale else "FALSE"),
-            ("-DENSITY", str(props.bake_resolution)),
-            ("-CENTER", "0.0", "0.0", "0.0"),
-            ("-SUPRESS", "TRUE" if props.mof_suppress_validation else "FALSE"),
-            ("-QUAD", "TRUE"),
-            ("-WELD", "FALSE"),
-            ("-FLAT", "TRUE"),
-            ("-CONE", "TRUE"),
-            ("-CONERATIO", "0.5"),
-            ("-GRIDS", "TRUE"),
-            ("-STRIP", "TRUE"),
-            ("-PATCH", "TRUE"),
-            ("-PLANES", "TRUE"),
-            ("-FLATT", "0.9"),
-            ("-MERGE", "TRUE"),
-            ("-MERGELIMIT", "0.0"),
-            ("-PRESMOOTH", "TRUE"),
-            ("-SOFTUNFOLD", "TRUE"),
-            ("-TUBES", "TRUE"),
-            ("-JUNCTIONSDEBUG", "TRUE"),
-            ("-EXTRADEBUG", "FALSE"),
-            ("-ABF", "TRUE"),
-            ("-SMOOTH", "TRUE" if props.mof_smooth else "FALSE"),
-            ("-REPAIRSMOOTH", "TRUE"),
-            ("-REPAIR", "TRUE"),
-            ("-SQUARE", "TRUE"),
-            ("-RELAX", "TRUE"),
-            ("-RELAX_ITERATIONS", "50"),
-            ("-EXPAND", "0.07"),
-            ("-CUTDEBUG", "TRUE"),
-            ("-STRETCH", "TRUE"),
-            ("-MATCH", "TRUE"),
-            ("-PACKING", "TRUE"),
-            ("-RASTERIZATION", "64"),
-            ("-PACKING_ITERATIONS", "3"),
-            ("-SCALETOFIT", "0.5"),
-            ("-VALIDATE", "FALSE"),
-        ]
-        for param in params:
-            cmd.extend(param)
-        
-        # Run MOF
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0 and not os.path.exists(out_path):
-                self.report({'ERROR'}, f"MOF failed with code: {result.returncode}")
-                shutil.rmtree(extract_path)
-                return False
-        except Exception as e:
-            self.report({'ERROR'}, f"Error running MOF: {e}")
-            shutil.rmtree(extract_path)
-            return False
-        
-        # Import the result
-        try:
-            bpy.ops.wm.obj_import(filepath=out_path, forward_axis='Y', up_axis='Z')
-        except Exception as e:
-            self.report({'ERROR'}, f"Import failed: {e}")
-            shutil.rmtree(extract_path)
-            return False
-        
-        # Transfer UVs back to original object
-        imported_obj = context.active_object
-        if imported_obj and imported_obj.type == 'MESH':
-            # Ensure UV layer exists
-            if not obj.data.uv_layers:
-                obj.data.uv_layers.new()
-            
-            # Create data transfer modifier
-            context.view_layer.objects.active = obj
-            dt_mod = obj.modifiers.new(name="DataTransfer", type='DATA_TRANSFER')
-            dt_mod.object = imported_obj
-            dt_mod.use_loop_data = True
-            dt_mod.data_types_loops = {'UV'}
-            dt_mod.loop_mapping = 'TOPOLOGY'
-            
-            bpy.ops.object.modifier_apply(modifier=dt_mod.name)
-            
-            # Delete imported object
-            bpy.data.objects.remove(imported_obj, do_unlink=True)
-            
-            # IMPORTANT: Scale UVs to fit within 0-1 range
-#            context.view_layer.objects.active = obj
-#            bpy.ops.object.mode_set(mode='EDIT')
-#            bpy.ops.mesh.select_all(action='SELECT')
-#            bpy.ops.uv.select_all(action='SELECT')
-            
-            # Average island scale first
-#            bpy.ops.uv.average_islands_scale()
-            
-            # Pack to ensure everything is in 0-1 range
-#            bpy.ops.uv.pack_islands(margin=0.001)
-            
-#            bpy.ops.object.mode_set(mode='OBJECT')
-        
-        # Cleanup
-        for fp in (in_path, out_path):
-            if os.path.exists(fp):
-                try:
-                    os.remove(fp)
-                except:
-                    pass
-        
-        try:
-            shutil.rmtree(extract_path)
-        except:
-            pass
-        
-        return True
     
     def analyze_materials(self, materials):
         """Analyze materials to determine what needs baking"""
@@ -2385,282 +3020,93 @@ class GLB_OT_ProcessAndExport(Operator):
         self.created_images.append(image)
         return image
     
-    def bake_listed_object(self, context, obj, target_uv_name):
-        """Bake one object's materials to a chosen UV map, producing a new material
-        with UV Map nodes explicitly pointing at target_uv_name."""
-        props = context.scene.glb_export_props
+    def begin_uv_safe_bake(self, obj, materials, target_uv_name=None):
+        """Set bake target UV active + render-active, pin only IMPLICIT UV readers
+        (empty UV Map nodes, TexCoord UV outputs, image textures with unlinked
+        Vector) to the previously render-active UV. Named UV Map nodes are left
+        untouched. Returns state for end_uv_safe_bake()."""
+        state = {'pins': [], 'orig_render_uv': None}
+        uv_layers = obj.data.uv_layers
+        if not uv_layers:
+            return state
 
-        if not obj.data or target_uv_name == 'NONE' or target_uv_name not in obj.data.uv_layers:
-            print(f"Custom UV bake skipped for {obj.name}: target UV '{target_uv_name}' not found")
-            return False
+        orig = next((uv for uv in uv_layers if uv.active_render), None)
+        orig_name = orig.name if orig else uv_layers[0].name
+        state['orig_render_uv'] = orig_name
 
-        materials = [slot.material for slot in obj.material_slots if slot.material]
-        if not materials:
-            print(f"Custom UV bake skipped for {obj.name}: no materials")
-            return False
-
-        # Detect source UV: first UV layer that isn't the target
-        source_uv_name = None
-        for uv in obj.data.uv_layers:
-            if uv.name != target_uv_name:
-                source_uv_name = uv.name
-                break
-        if not source_uv_name:
-            print(f"Custom UV bake skipped for {obj.name}: no source UV (need 2+ UV layers)")
-            return False
-
-        # Select & activate this object only
-        bpy.ops.object.select_all(action='DESELECT')
-        context.view_layer.objects.active = obj
-        obj.select_set(True)
-
-        # Make the target UV the active one — this is what bake writes to.
-        # Use the same API pattern the main bake uses (collection-level .active),
-        # otherwise tangent space and AO bakes compute from the wrong UV.
-        target_uv_layer = obj.data.uv_layers.get(target_uv_name)
-        if target_uv_layer is not None:
-            obj.data.uv_layers.active = target_uv_layer
-            target_uv_layer.active_render = True
-
-        # Temporarily force source texture nodes to read from source_uv_name so the
-        # bake samples the original projection. We walk backwards through any chain
-        # of Mapping/Reroute nodes to find the real coordinate source, then handle
-        # three cases:
-        #   1) UVMAP node            -> change its uv_map to the source UV
-        #   2) TEX_COORD.UV socket   -> splice in a UVMAP node before the consumer
-        #   3) TEX_COORD.Object/Gen/Normal or Geometry -> leave alone (procedural)
-        temp_uv_wiring = []
-        TEX_NODES = {'TEX_IMAGE', 'TEX_NOISE', 'TEX_VORONOI', 'TEX_MUSGRAVE',
-                     'TEX_WAVE', 'TEX_BRICK', 'TEX_CHECKER', 'TEX_GRADIENT', 'TEX_MAGIC'}
-
-        def find_coord_source(socket, visited=None):
-            """Walk backwards through Mapping/Reroute nodes; return (node, output_socket) or (None, None)."""
-            if visited is None:
-                visited = set()
-            if not socket.is_linked:
-                return (None, None)
-            link = socket.links[0]
-            from_node = link.from_node
-            if from_node.name in visited:
-                return (None, None)
-            visited.add(from_node.name)
-            if from_node.type in {'MAPPING', 'REROUTE'}:
-                # Mapping has 'Vector' input, Reroute has 'Input'
-                next_input = from_node.inputs.get('Vector') or (from_node.inputs[0] if from_node.inputs else None)
-                if next_input is None:
-                    return (None, None)
-                return find_coord_source(next_input, visited)
-            return (from_node, link.from_socket)
+        target = uv_layers.get(target_uv_name) if target_uv_name else uv_layers.active
+        if target is not None:
+            uv_layers.active = target
+            target.active_render = True
 
         for mat in materials:
-            if not mat.use_nodes:
+            if not mat or not mat.use_nodes:
                 continue
             nodes = mat.node_tree.nodes
             links = mat.node_tree.links
             for node in list(nodes):
-                if node.type not in TEX_NODES:
-                    continue
-                vector_input = node.inputs.get('Vector')
-                if not vector_input:
-                    continue
+                if node.type == 'GROUP':
+                    msg = (f"Material '{mat.name}' contains node group '{node.name}' - "
+                           f"UV nodes inside groups are not handled, bake may read wrong UVs")
+                    print(f"WARNING: {msg}")
+                    try:
+                        self.report({'WARNING'}, msg)
+                    except Exception:
+                        pass
+                elif node.type == 'UVMAP' and node.uv_map == "":
+                    node.uv_map = orig_name
+                    state['pins'].append(('EMPTY_UVMAP', mat, node))
+                elif node.type == 'TEX_COORD':
+                    uv_out = node.outputs.get('UV')
+                    if uv_out and uv_out.is_linked:
+                        pin = nodes.new('ShaderNodeUVMap')
+                        pin.uv_map = orig_name
+                        pin.label = "_glb_uv_pin"
+                        pin.location = (node.location.x + 180, node.location.y - 160)
+                        consumers = [l.to_socket for l in uv_out.links]
+                        for l in list(uv_out.links):
+                            links.remove(l)
+                        for s in consumers:
+                            links.new(pin.outputs['UV'], s)
+                        state['pins'].append(('TC_UV', mat, pin, uv_out, consumers))
+                elif node.type == 'TEX_IMAGE':
+                    vec = node.inputs.get('Vector')
+                    if vec and not vec.is_linked:
+                        pin = nodes.new('ShaderNodeUVMap')
+                        pin.uv_map = orig_name
+                        pin.label = "_glb_uv_pin"
+                        pin.location = (node.location.x - 250, node.location.y)
+                        links.new(pin.outputs['UV'], vec)
+                        state['pins'].append(('EMPTY_VECTOR', mat, pin))
+        return state
 
-                if not vector_input.is_linked:
-                    # No coordinate source at all - inject a UVMAP feeding source UV
-                    uv_map_node = nodes.new('ShaderNodeUVMap')
-                    uv_map_node.uv_map = source_uv_name
-                    uv_map_node.location = (node.location.x - 250, node.location.y)
-                    links.new(uv_map_node.outputs['UV'], vector_input)
-                    temp_uv_wiring.append(('ADDED', mat, uv_map_node, node))
-                    continue
-
-                source_node, source_socket = find_coord_source(vector_input)
-                if source_node is None:
-                    continue
-
-                if source_node.type == 'UVMAP':
-                    # Case 1: redirect existing UVMAP to source UV
-                    original_uv = source_node.uv_map
-                    source_node.uv_map = source_uv_name
-                    temp_uv_wiring.append(('MODIFIED', mat, source_node, original_uv))
-
-                elif source_node.type == 'TEX_COORD' and source_socket.name == 'UV':
-                    # Case 2: TEX_COORD.UV reads the active UV (which is the bake target).
-                    # Splice in a UVMAP node pointing to source_uv_name to override that.
-                    # Find the consumer that this socket directly feeds.
-                    for link in list(source_socket.links):
-                        consumer_socket = link.to_socket
-                        # Only redirect links that lead (directly or via Mapping/Reroute) to this texture node.
-                        # Easiest: redirect every consumer of TEX_COORD.UV that's reachable to a TEX node.
-                        uv_map_node = nodes.new('ShaderNodeUVMap')
-                        uv_map_node.uv_map = source_uv_name
-                        uv_map_node.location = (source_node.location.x + 200, source_node.location.y - 150)
-                        links.remove(link)
-                        links.new(uv_map_node.outputs['UV'], consumer_socket)
-                        temp_uv_wiring.append(('SPLICED_TC_UV', mat, uv_map_node,
-                                               source_socket, consumer_socket))
-                    # Stop after first splice for this texture node — repeated TEX_COORD.UV
-                    # consumers will be handled when their own texture nodes are processed.
-
-                # Case 3: TEX_COORD.Object/Generated/Normal or NEW_GEOMETRY -> leave alone
-                # (procedural, handled by Mapping compensation elsewhere)
-
-        # Analyze + prep
-        bake_data = self.analyze_materials(materials)
-        self.prepare_materials_for_baking(materials, bake_data)
-        bake_data = self.analyze_materials(materials)
-
-        # Build new baked material
-        new_mat = bpy.data.materials.new(name=f"{obj.name}_BakedCustomUV")
-        new_mat.use_nodes = True
-        self.baked_materials.append(new_mat)
-
-        nodes = new_mat.node_tree.nodes
-        links = new_mat.node_tree.links
-        nodes.clear()
-
-        output = nodes.new('ShaderNodeOutputMaterial')
-        output.location = (400, 0)
-        principled = nodes.new('ShaderNodeBsdfPrincipled')
-        principled.location = (100, 0)
-        links.new(principled.outputs['BSDF'], output.inputs['Surface'])
-
-        y = 300
-
-        def wire_texture(image, input_name, non_color=False):
-            nonlocal y
-            tex = nodes.new('ShaderNodeTexImage')
-            tex.image = image
-            if non_color and tex.image.colorspace_settings.name != 'Non-Color':
-                tex.image.colorspace_settings.name = 'Non-Color'
-            tex.location = (-400, y)
-            
-            # Pin Vector to target UV explicitly. Without this, the texture samples
-            # from the active UV — which after re-merge is UVMap, not the target.
-            uv_node = nodes.new('ShaderNodeUVMap')
-            uv_node.uv_map = target_uv_name
-            uv_node.location = (-650, y)
-            links.new(uv_node.outputs['UV'], tex.inputs['Vector'])
-            
-            links.new(tex.outputs['Color'], principled.inputs[input_name])
-            y -= 300
-            return tex
-        coord_splices = []
-        try:
-            # Inject Mapping nodes to compensate for the addon's scale + location transforms
-            # so procedural textures using Texture Coordinate -> Object bake at original size
-            coord_splices = self.inject_coord_compensation(obj)
-            
-            if bake_data['color']['needs_baking']:
-                img = self.create_image(f"{obj.name}_Color", props.bake_resolution, 'sRGB')
-                self.bake_channel(obj, materials, img, 'EMIT', 'Base Color', bake_data['color'])
-                wire_texture(img, 'Base Color')
-            else:
-                principled.inputs['Base Color'].default_value = bake_data['color']['uniform_value']
-
-            if bake_data['metallic']['needs_baking']:
-                img = self.create_image(f"{obj.name}_Metallic", props.bake_resolution, 'Non-Color')
-                self.bake_channel(obj, materials, img, 'EMIT', 'Metallic', bake_data['metallic'])
-                wire_texture(img, 'Metallic', non_color=True)
-            else:
-                principled.inputs['Metallic'].default_value = bake_data['metallic']['uniform_value']
-
-            if bake_data['roughness']['needs_baking']:
-                img = self.create_image(f"{obj.name}_Roughness", props.bake_resolution, 'Non-Color')
-                self.bake_channel(obj, materials, img, 'EMIT', 'Roughness', bake_data['roughness'])
-                wire_texture(img, 'Roughness', non_color=True)
-            else:
-                principled.inputs['Roughness'].default_value = bake_data['roughness']['uniform_value']
-
-            if bake_data['normal']['needs_baking']:
-                img = self.create_image(f"{obj.name}_Normal", props.bake_resolution, 'Non-Color')
-                self.bake_normal(obj, materials, img)
-                tex = nodes.new('ShaderNodeTexImage')
-                tex.image = img
-                tex.location = (-400, y)
-                
-                # Pin Vector to target UV
-                uv_node = nodes.new('ShaderNodeUVMap')
-                uv_node.uv_map = target_uv_name
-                uv_node.location = (-650, y)
-                links.new(uv_node.outputs['UV'], tex.inputs['Vector'])
-                
-                normal_map_node = nodes.new('ShaderNodeNormalMap')
-                normal_map_node.location = (-150, y)
-                links.new(tex.outputs['Color'], normal_map_node.inputs['Color'])
-                links.new(normal_map_node.outputs['Normal'], principled.inputs['Normal'])
-                y -= 300
-
-            # Alpha handling — same logic as main bake
-            if not bake_data['alpha'].get('skip', False):
-                if bake_data['alpha']['needs_baking']:
-                    img = self.create_image(f"{obj.name}_Alpha", props.bake_resolution, 'Non-Color')
-                    self.bake_channel(obj, materials, img, 'EMIT', 'Alpha', bake_data['alpha'])
-
-                    tex = nodes.new('ShaderNodeTexImage')
-                    tex.image = img
-                    if tex.image.colorspace_settings.name != 'Non-Color':
-                        tex.image.colorspace_settings.name = 'Non-Color'
-                    tex.location = (-400, y)
-                    
-                    uv_node = nodes.new('ShaderNodeUVMap')
-                    uv_node.uv_map = target_uv_name
-                    uv_node.location = (-650, y)
-                    links.new(uv_node.outputs['UV'], tex.inputs['Vector'])
-                    
-                    links.new(tex.outputs['Color'], principled.inputs['Alpha'])
-                    y -= 300
-                else:
-                    principled.inputs['Alpha'].default_value = bake_data['alpha']['uniform_value']
-                # Set the material to BLEND mode so transparency is honored on export.
-                # Force backface culling so glTF exports doubleSided=False, otherwise
-                # back faces render through front faces in BLEND mode and look like
-                # ghost transparency on actually-opaque areas of the texture.
-                new_mat.blend_method = 'BLEND'
-                new_mat.use_backface_culling = True
-                if hasattr(new_mat, 'surface_render_method'):
-                    new_mat.surface_render_method = 'BLENDED'
-
-            if props.bake_ambient_occlusion:
-                img = self.create_image(f"{obj.name}_AO", props.bake_resolution, 'Non-Color')
-                self.bake_ambient_occlusion(obj, img)
-                self.create_gltf_output_node(new_mat, img, uv_map_name=target_uv_name)
-        finally:
-            # Remove the injected Mapping nodes (always, even if a bake threw)
-            self.remove_coord_compensation(coord_splices)
-            
-            # Restore source materials to original UV wiring
-            for entry in temp_uv_wiring:
-                kind = entry[0]
-                try:
-                    if kind == 'ADDED':
-                        _, mat, uv_map_node, target_node = entry
-                        for link in list(target_node.inputs['Vector'].links):
-                            mat.node_tree.links.remove(link)
-                        mat.node_tree.nodes.remove(uv_map_node)
-                    elif kind == 'MODIFIED':
-                        _, mat, uv_map_node, original_uv = entry
-                        uv_map_node.uv_map = original_uv
-                    elif kind == 'SPLICED_TC_UV':
-                        _, mat, uv_map_node, original_source_socket, consumer_socket = entry
-                        # Remove the spliced UVMAP node's link, restore original TEX_COORD.UV link
-                        for link in list(uv_map_node.outputs['UV'].links):
-                            mat.node_tree.links.remove(link)
-                        mat.node_tree.links.new(original_source_socket, consumer_socket)
-                        mat.node_tree.nodes.remove(uv_map_node)
-                except Exception as e:
-                    print(f"Warning: UV wiring cleanup failed: {e}")
-
-        obj.data.materials.clear()
-        obj.data.materials.append(new_mat)
-
-        # Keep only the target UV layer on this object
-        uv_names_to_remove = [uv.name for uv in obj.data.uv_layers if uv.name != target_uv_name]
-        for uv_name in uv_names_to_remove:
-            if uv_name in obj.data.uv_layers:
-                obj.data.uv_layers.remove(obj.data.uv_layers[uv_name])
-
-        print(f"Custom UV bake complete for {obj.name} → {target_uv_name} (source: {source_uv_name})")
-        return True
+    def end_uv_safe_bake(self, obj, state):
+        """Undo begin_uv_safe_bake() in reverse order, restore render UV."""
+        for entry in reversed(state.get('pins', [])):
+            kind = entry[0]
+            try:
+                if kind == 'EMPTY_UVMAP':
+                    _, mat, node = entry
+                    node.uv_map = ""
+                elif kind == 'TC_UV':
+                    _, mat, pin, uv_out, consumers = entry
+                    links = mat.node_tree.links
+                    for l in list(pin.outputs['UV'].links):
+                        links.remove(l)
+                    for s in consumers:
+                        links.new(uv_out, s)
+                    mat.node_tree.nodes.remove(pin)
+                elif kind == 'EMPTY_VECTOR':
+                    _, mat, pin = entry
+                    links = mat.node_tree.links
+                    for l in list(pin.outputs['UV'].links):
+                        links.remove(l)
+                    mat.node_tree.nodes.remove(pin)
+            except Exception as e:
+                print(f"Warning: UV pin cleanup failed: {e}")
+        orig_name = state.get('orig_render_uv')
+        if orig_name and orig_name in obj.data.uv_layers:
+            obj.data.uv_layers[orig_name].active_render = True
     
     def bake_channel(self, obj, materials, target_image, bake_type, channel_name, bake_data):
         props = bpy.context.scene.glb_export_props
@@ -2707,65 +3153,7 @@ class GLB_OT_ProcessAndExport(Operator):
             
             if channel_input.is_linked:
                 link = channel_input.links[0]
-                from_node = link.from_node
                 from_socket = link.from_socket
-                
-                # FIX: Check if this is a texture that needs UV remapping
-                if from_node.type in ['TEX_IMAGE', 'TEX_NOISE', 'TEX_VORONOI', 'TEX_MUSGRAVE', 
-                                      'TEX_WAVE', 'TEX_BRICK', 'TEX_CHECKER', 'TEX_GRADIENT', 'TEX_MAGIC']:
-                    
-                    original_uv = "UVMap_01"  # The renamed original UV
-                    
-                    # Only remap if the original UV exists (meaning we did UV unwrapping)
-                    if original_uv in obj.data.uv_layers:
-                        vector_input = from_node.inputs.get('Vector')
-                        
-                        if vector_input:
-                            # Store the original connection for restoration
-                            original_vector_link = None
-                            if vector_input.is_linked:
-                                original_vector_link = vector_input.links[0]
-                                connections_to_restore.append({
-                                    'material': mat,
-                                    'from_socket': original_vector_link.from_socket,
-                                    'to_socket': vector_input,
-                                    'restore_after': True
-                                })
-                            
-                            # Create or update UV Map node to use original UV
-                            if vector_input.is_linked:
-                                vec_link = vector_input.links[0]
-                                vec_node = vec_link.from_node
-                                
-                                if vec_node.type == 'UVMAP':
-                                    # Store original UV map selection
-                                    connections_to_restore.append({
-                                        'material': mat,
-                                        'uv_node': vec_node,
-                                        'original_uv_map': vec_node.uv_map,
-                                        'restore_uv_map': True
-                                    })
-                                    # Update to use original UV for baking
-                                    vec_node.uv_map = original_uv
-                                    print(f"Updated existing UV Map node to use: {original_uv}")
-                                    
-                                elif vec_node.type == 'TEX_COORD':
-                                    # Replace Texture Coordinate with UV Map node
-                                    links.remove(vec_link)
-                                    read_uv_node = nodes.new('ShaderNodeUVMap')
-                                    read_uv_node.uv_map = original_uv
-                                    read_uv_node.location = vec_node.location
-                                    temp_nodes.append((mat, read_uv_node))
-                                    links.new(read_uv_node.outputs['UV'], vector_input)
-                                    print(f"Replaced Texture Coordinate with UV Map node using: {original_uv}")
-                            else:
-                                # No UV connected, create new UV Map node
-                                read_uv_node = nodes.new('ShaderNodeUVMap')
-                                read_uv_node.uv_map = original_uv
-                                read_uv_node.location = (from_node.location[0] - 200, from_node.location[1])
-                                temp_nodes.append((mat, read_uv_node))
-                                links.new(read_uv_node.outputs['UV'], vector_input)
-                                print(f"Created new UV Map node using: {original_uv}")
                 
                 # Disconnect from principled and connect to output for baking
                 links.remove(link)
@@ -3414,14 +3802,19 @@ class GLB_PT_ExportPanel(Panel):
         # Import section at the top
         import_box = layout.box()
         import_col = import_box.column()
-        import_col.label(text="Import Blend Files", icon='IMPORT')
-        
         row = import_col.row(align=True)
-        row.prop(props, "import_folder_path", text="")
-        if props.import_folder_path:
-            row.operator("glb_export.clear_import_path", icon='X', text="")
+        row.prop(props, "show_import_blend",
+                 icon='TRIA_DOWN' if props.show_import_blend else 'TRIA_RIGHT',
+                 icon_only=True, emboss=False)
+        row.label(text="Import Blend Files", icon='IMPORT')
         
-        import_col.operator("glb_export.import_blend_files", text="Import Files", icon='IMPORT')
+        if props.show_import_blend:
+            row = import_col.row(align=True)
+            row.prop(props, "import_folder_path", text="")
+            if props.import_folder_path:
+                row.operator("glb_export.clear_import_path", icon='X', text="")
+            
+            import_col.operator("glb_export.import_blend_files", text="Import Files", icon='IMPORT')
         
         # UV Unwrap settings
         layout.separator()
@@ -3455,65 +3848,77 @@ class GLB_PT_ExportPanel(Panel):
             
             # Show settings based on selected method
             if props.uv_unwrap_method == 'SMART':
-                # Smart UV Project settings
                 row = uv_col.row(align=True)
-                row.prop(props, "uv_angle_limit")
-                
-                row = uv_col.row(align=True)
-                row.prop(props, "uv_margin_method", text="")
-                
-                row = uv_col.row(align=True)
-                row.prop(props, "uv_rotation_method", text="")
-                
-                row = uv_col.row(align=True)
-                row.prop(props, "uv_island_margin")
-                
-                row = uv_col.row(align=True)
-                row.prop(props, "uv_area_weight")
-                
-                row = uv_col.row(align=True)
-                row.prop(props, "uv_correct_aspect")
-                
-                row = uv_col.row(align=True)
-                row.prop(props, "uv_scale_to_bounds")
+                row.prop(props, "show_smart_settings",
+                         icon='TRIA_DOWN' if props.show_smart_settings else 'TRIA_RIGHT',
+                         icon_only=True, emboss=False)
+                row.label(text="Smart UV Project Settings")
+                if props.show_smart_settings:
+                    row = uv_col.row(align=True)
+                    row.prop(props, "uv_angle_limit")
+                    
+                    row = uv_col.row(align=True)
+                    row.prop(props, "uv_margin_method", text="")
+                    
+                    row = uv_col.row(align=True)
+                    row.prop(props, "uv_rotation_method", text="")
+                    
+                    row = uv_col.row(align=True)
+                    row.prop(props, "uv_island_margin")
+                    
+                    row = uv_col.row(align=True)
+                    row.prop(props, "uv_area_weight")
+                    
+                    row = uv_col.row(align=True)
+                    row.prop(props, "uv_correct_aspect")
+                    
+                    row = uv_col.row(align=True)
+                    row.prop(props, "uv_scale_to_bounds")
             
             elif props.uv_unwrap_method == 'MOF':
-                # MOF settings
-                uv_col.label(text="MOF General Settings:")
                 row = uv_col.row(align=True)
-                row.prop(props, "mof_separate_hard_edges")
-                
-                row = uv_col.row(align=True)
-                row.prop(props, "mof_separate_marked_edges")
-                
-                row = uv_col.row(align=True)
-                row.prop(props, "mof_overlap_identical")
-                
-                row = uv_col.row(align=True)
-                row.prop(props, "mof_overlap_mirrored")
-                
-                row = uv_col.row(align=True)
-                row.prop(props, "mof_world_scale")
-                
-                row = uv_col.row(align=True)
-                row.prop(props, "mof_use_normals")
-                
-                row = uv_col.row(align=True)
-                row.prop(props, "mof_suppress_validation")
-                
-                row = uv_col.row(align=True)
-                row.prop(props, "mof_smooth")
-                
-                row = uv_col.row(align=True)
-                row.prop(props, "mof_keep_original")
-                
-                row = uv_col.row(align=True)
-                row.prop(props, "mof_triangulate")
+                row.prop(props, "show_mof_settings",
+                         icon='TRIA_DOWN' if props.show_mof_settings else 'TRIA_RIGHT',
+                         icon_only=True, emboss=False)
+                row.label(text="MOF General Settings")
+                if props.show_mof_settings:
+                    row = uv_col.row(align=True)
+                    row.prop(props, "mof_separate_hard_edges")
+                    
+                    row = uv_col.row(align=True)
+                    row.prop(props, "mof_separate_marked_edges")
+                    
+                    row = uv_col.row(align=True)
+                    row.prop(props, "mof_overlap_identical")
+                    
+                    row = uv_col.row(align=True)
+                    row.prop(props, "mof_overlap_mirrored")
+                    
+                    row = uv_col.row(align=True)
+                    row.prop(props, "mof_world_scale")
+                    
+                    row = uv_col.row(align=True)
+                    row.prop(props, "mof_use_normals")
+                    
+                    row = uv_col.row(align=True)
+                    row.prop(props, "mof_suppress_validation")
+                    
+                    row = uv_col.row(align=True)
+                    row.prop(props, "mof_smooth")
+                    
+                    row = uv_col.row(align=True)
+                    row.prop(props, "mof_keep_original")
+                    
+                    row = uv_col.row(align=True)
+                    row.prop(props, "mof_triangulate")
             
             # Packing checkbox with expand arrow
             uv_col.separator()
             row = uv_col.row(align=True)
-            row.prop(props, "enable_uv_pack")
+            if props.uv_unwrap_method == 'MOF':
+                row.label(text="Pack UVs", icon='CHECKBOX_HLT')
+            else:
+                row.prop(props, "enable_uv_pack")
 
             # Always show expand arrow when pack is enabled
             if props.enable_uv_pack:
@@ -3569,6 +3974,17 @@ class GLB_PT_ExportPanel(Panel):
                 row = uv_col.row(align=True)
                 row.prop(props, "pack_udim_target", text="")
 
+            # Unwrap button
+            uv_col.separator()
+            row = uv_col.row()
+            row.scale_y = 1.3
+            if _UNWRAP_RUNNING:
+                row.alert = True
+                row.operator("glb_export.unwrap_cancel",
+                             text="Unwrapping...  Click or ESC to cancel", icon='X')
+            else:
+                row.operator("glb_export.unwrap_selected", icon='UV')
+
         # Custom UV Bake section
         layout.separator()
         box = layout.box()
@@ -3602,42 +4018,85 @@ class GLB_PT_ExportPanel(Panel):
         row.prop(props, "show_baking", icon='TRIA_DOWN' if props.show_baking else 'TRIA_RIGHT', icon_only=True, emboss=False)
         row.label(text="Material Baking")
         if props.show_baking:
-            box.prop(props, "enable_baking")
-            box.prop(props, "bake_ambient_occlusion")
+            def switch_row(parent, prop_id, label):
+                sp = parent.row().split(factor=0.4)
+                lab = sp.row()
+                lab.alignment = 'RIGHT'
+                lab.label(text=label)
+                sp.prop(props, prop_id,
+                        text="On" if getattr(props, prop_id) else "Off",
+                        toggle=True)
+
+            def num_row(parent, prop_id, label):
+                sp = parent.row(align=True).split(factor=0.4)
+                lab = sp.row()
+                lab.alignment = 'RIGHT'
+                lab.label(text=label)
+                fr = sp.row(align=True)
+                o = fr.operator("glb_export.halve_double", text="", icon='TRIA_LEFT')
+                o.prop_name = prop_id
+                o.double = False
+                fr.prop(props, prop_id, text="")
+                o = fr.operator("glb_export.halve_double", text="", icon='TRIA_RIGHT')
+                o.prop_name = prop_id
+                o.double = True
+
+            switch_row(box, "enable_baking", "Bake Materials")
 
             if props.enable_baking or props.bake_ambient_occlusion:
                 col = box.column(align=True)
-                if props.bake_ambient_occlusion:
-                    ao_col = col.column(align=True)
-                    ao_col.prop(props, "ao_samples")
-                    ao_col.prop(props, "ao_distance")
+                num_row(col, "bake_resolution", "Resolution")
+                num_row(col, "bake_samples", "Samples")
+                num_row(col, "bake_margin", "Margin")
 
-                    # AO Exceptions (expandable)
-                    exc_box = col.box()
-                    row = exc_box.row()
-                    row.prop(props, "show_ao_exceptions",
-                             icon='TRIA_DOWN' if props.show_ao_exceptions else 'TRIA_RIGHT',
-                             icon_only=True, emboss=False)
-                    row.prop(props, "ao_use_exceptions")
-                    if props.show_ao_exceptions:
-                        sub = exc_box.column()
-                        sub.enabled = props.ao_use_exceptions
-                        sub.operator("glb_export.add_selected_ao_exceptions", icon='RESTRICT_SELECT_OFF')
-                        list_row = sub.row()
-                        list_row.template_list(
-                            "GLB_UL_AOExceptions", "",
-                            props, "ao_exception_objects",
-                            props, "ao_exception_index",
-                            rows=3,
-                        )
-                        btn_col = list_row.column(align=True)
-                        btn_col.operator("glb_export.add_ao_exception", icon='ADD', text="")
-                        btn_col.operator("glb_export.remove_ao_exception", icon='REMOVE', text="")
+            switch_row(box, "bake_ambient_occlusion", "Ambient Occlusion")
+            if props.bake_ambient_occlusion:
+                ao_col = box.column(align=True)
+                num_row(ao_col, "ao_samples", "AO Samples")
+                num_row(ao_col, "ao_distance", "AO Distance")
 
-                col.separator()
-                col.prop(props, "bake_resolution")
-                col.prop(props, "bake_samples")
-                col.prop(props, "bake_margin")
+                # AO Exceptions (expandable)
+                row = box.row()
+                row.prop(props, "show_ao_exceptions",
+                         icon='TRIA_DOWN' if props.show_ao_exceptions else 'TRIA_RIGHT',
+                         icon_only=True, emboss=False)
+                row.prop(props, "ao_use_exceptions")
+                if props.show_ao_exceptions:
+                    sub = box.column()
+                    sub.enabled = props.ao_use_exceptions
+                    sub.operator("glb_export.add_selected_ao_exceptions", icon='RESTRICT_SELECT_OFF')
+                    list_row = sub.row()
+                    list_row.template_list(
+                        "GLB_UL_AOExceptions", "",
+                        props, "ao_exception_objects",
+                        props, "ao_exception_index",
+                        rows=3,
+                    )
+                    btn_col = list_row.column(align=True)
+                    btn_col.operator("glb_export.add_ao_exception", icon='ADD', text="")
+                    btn_col.operator("glb_export.remove_ao_exception", icon='REMOVE', text="")
+
+            if props.enable_baking:
+                row = box.row(align=True)
+                row.prop(props, "show_alpha_mode",
+                         icon='TRIA_DOWN' if props.show_alpha_mode else 'TRIA_RIGHT',
+                         icon_only=True, emboss=False)
+                row.label(text="Alpha Mode")
+                if props.show_alpha_mode:
+                    acol = box.column()
+                    acol.prop(props, "alpha_mode", text="Default")
+                    if props.alpha_mode == 'MASK':
+                        acol.prop(props, "alpha_threshold")
+                    acol.operator("glb_export.scan_alpha_collections", icon='VIEWZOOM')
+                    for item in props.alpha_collections:
+                        if not item.collection_ref:
+                            continue
+                        row = acol.row(align=True)
+                        row.label(text=item.collection_ref.name, icon='OUTLINER_COLLECTION')
+                        row.prop(item, "alpha_mode", text="")
+                        if item.alpha_mode == 'MASK':
+                            row.prop(item, "alpha_threshold", text="")
+                        row.prop(item, "double_sided", text="2-Sided", toggle=True)
         
         # Export settings
         layout.separator()
@@ -3656,10 +4115,21 @@ class GLB_PT_ExportPanel(Panel):
         col = layout.column()
         col.scale_y = 2.0
         
-        button_text = "Process Visible Collections"
-        if props.export_enabled:
-            button_text = "Process & Export"
-        col.operator("glb_export.process_export", text=button_text, icon='PLAY')
+        if props.export_running:
+            col.progress(factor=props.export_progress, type='BAR',
+                         text=props.export_status)
+            hint = layout.row()
+            hint.alignment = 'CENTER'
+            hint.label(text="ESC to cancel (works between steps)", icon='INFO')
+        else:
+            button_text = "Process Visible Collections"
+            if props.export_enabled:
+                button_text = "Process & Export"
+            col.operator("glb_export.process_export", text=button_text, icon='PLAY')
+            report_row = layout.row()
+            report_row.alignment = 'RIGHT'
+            report_row.operator("glb_export.show_report",
+                                text="Last Export Report", icon='INFO')
 
 
 # ============================================================
@@ -4168,19 +4638,21 @@ class GLB_PT_NormalBakePanel(Panel):
 classes = (   
     GLBBakeUVTarget,
     GLBAOExceptionItem,
+    GLBAlphaCollectionItem,
     GLBExportProperties,
     GLB_UL_CustomUVBakeTargets,
     GLB_OT_ScanCustomUVTargets,
     GLB_OT_AddCustomUVTarget,
     GLB_OT_RemoveCustomUVTarget,
+    GLB_OT_ScanAlphaCollections,
+    GLB_OT_UnwrapSelected,
+    GLB_OT_UnwrapCancel,
+    GLB_OT_ShowExportReport,
+    GLB_OT_HalveDouble,
     GLB_UL_AOExceptions,
     GLB_OT_AddAOException,
     GLB_OT_RemoveAOException,
     GLB_OT_AddSelectedAOExceptions,
-    UPDATER_OT_check,
-    UPDATER_OT_install,
-    UPDATER_OT_popup,
-    UPDATER_PT_panel,
     GLB_OT_CleanupProcessedCollections,
     GLB_OT_OpenExportFolder,
     GLB_OT_ClearImportPath,
@@ -4204,7 +4676,6 @@ def register():
     bpy.types.Scene.glb_nbake_props = bpy.props.PointerProperty(type=GLBNormalBakeProps)
     global _nbake_draw_handle
     _nbake_draw_handle = bpy.types.SpaceView3D.draw_handler_add(_nbake_draw_callback, (), 'WINDOW', 'POST_VIEW')
-    bpy.app.handlers.load_post.append(startup_handler)
 
     # Check for MOF resource file
     addon_dir = os.path.dirname(os.path.realpath(__file__))
@@ -4225,8 +4696,6 @@ def unregister():
         bpy.types.SpaceView3D.draw_handler_remove(_nbake_draw_handle, 'WINDOW')
         _nbake_draw_handle = None
     del bpy.types.Scene.glb_nbake_props
-    if startup_handler in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.remove(startup_handler)
     
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
