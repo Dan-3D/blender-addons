@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+id = "texture_resizer"
+name = "Texture Resizer"
+version = "1.0.0"
+tagline = "Resize all image textures in the file to a chosen resolution"
+maintainer = "Claude"
+type = "add-on"
+blender_version_min = "3.0.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read and write files"
