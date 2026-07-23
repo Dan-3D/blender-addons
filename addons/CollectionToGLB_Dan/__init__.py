@@ -2,7 +2,7 @@ bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
     "version": (1, 5, 0),
-    "blender": (5, 2, 0),
+    "blender": (5, 2, 1),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
     "category": "Import-Export",
@@ -11,6 +11,7 @@ bl_info = {
 import bpy
 import bmesh
 import os
+import math
 import re
 import subprocess
 import zipfile
@@ -471,11 +472,14 @@ class GLB_OT_UnwrapSelected(Operator):
         return context.mode == 'OBJECT' and any(
             o.type == 'MESH' for o in context.selected_objects)
 
-    def _pack_uvs(self, props):
+    def _pack_uvs(self, props, average=True):
         """Normalize + pack the currently selected UVs (must be in Edit Mode)."""
+        sync_prev = bpy.context.scene.tool_settings.use_uv_select_sync
+        bpy.context.scene.tool_settings.use_uv_select_sync = False
         try:
             bpy.ops.uv.select_all(action='SELECT')
-            bpy.ops.uv.average_islands_scale()
+            if average:
+                bpy.ops.uv.average_islands_scale()
             bpy.ops.uv.pack_islands(
                 margin=props.pack_margin,
                 rotate=props.pack_rotate,
@@ -490,6 +494,8 @@ class GLB_OT_UnwrapSelected(Operator):
             )
         except Exception as e:
             self.report({'WARNING'}, f"UV pack failed: {e}")
+        finally:
+            bpy.context.scene.tool_settings.use_uv_select_sync = sync_prev
 
     def _make_prepped_dup(self, context, obj, face_indices):
         """Duplicate obj (selected faces only if given) and preprocess exactly
@@ -804,7 +810,7 @@ class GLB_OT_UnwrapSelected(Operator):
         # ---------- SMART UV PROJECT (instant, unchanged) ----------
         if props.uv_unwrap_method == 'SMART':
             smart_kwargs = {
-                'angle_limit': props.uv_angle_limit,
+                'angle_limit': math.radians(props.uv_angle_limit),
                 'island_margin': props.uv_island_margin,
                 'area_weight': props.uv_area_weight,
                 'correct_aspect': props.uv_correct_aspect,
@@ -815,10 +821,14 @@ class GLB_OT_UnwrapSelected(Operator):
             try:
                 if in_edit:
                     bpy.ops.uv.smart_project(**smart_kwargs)
+                    if props.enable_uv_pack:
+                        self._pack_uvs(props, average=False)
                 else:
                     bpy.ops.object.mode_set(mode='EDIT')
                     bpy.ops.mesh.select_all(action='SELECT')
                     bpy.ops.uv.smart_project(**smart_kwargs)
+                    if props.enable_uv_pack:
+                        self._pack_uvs(props, average=False)
                     bpy.ops.object.mode_set(mode='OBJECT')
             except Exception as e:
                 if not in_edit and context.mode != 'OBJECT':
@@ -978,6 +988,7 @@ class GLB_OT_AddAOException(Operator):
         props = context.scene.glb_export_props
         props.ao_exception_objects.add()
         props.ao_exception_index = len(props.ao_exception_objects) - 1
+        ao_preview_refresh(context)
         return {'FINISHED'}
 
 
@@ -996,6 +1007,7 @@ class GLB_OT_RemoveAOException(Operator):
         if 0 <= idx < len(props.ao_exception_objects):
             props.ao_exception_objects.remove(idx)
             props.ao_exception_index = max(0, idx - 1)
+        ao_preview_refresh(context)
         return {'FINISHED'}
 
 
@@ -1015,6 +1027,7 @@ class GLB_OT_AddSelectedAOExceptions(Operator):
                 existing.add(obj.name)
                 added += 1
         self.report({'INFO'}, f"Added {added} object(s) to AO exceptions")
+        ao_preview_refresh(context)
         return {'FINISHED'}
 
 def delayed_cleanup(cleanup_data):
@@ -1133,23 +1146,287 @@ def poll_ao_exception_object(self, obj):
     return obj.type in {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'}
 
 
+def _ao_flag_update(self, context):
+    # Live-refresh the AO preview when an exception flag is toggled
+    if globals().get('_AO_PREVIEW'):
+        ao_preview_refresh(context)
+
+
 class GLBAOExceptionItem(PropertyGroup):
     object_ref: PointerProperty(
         name="Object",
         type=bpy.types.Object,
         description="Object affected by the AO exception flags",
         poll=poll_ao_exception_object,
+        update=_ao_flag_update,
     )
     no_cast: BoolProperty(
         name="No Cast",
         description="This object will not darken other objects in the AO bake",
-        default=True
+        default=True,
+        update=_ao_flag_update
     )
     no_receive: BoolProperty(
         name="No Receive",
         description="This object's surface stays fully white in the AO map (receives no ambient occlusion)",
-        default=False
+        default=False,
+        update=_ao_flag_update
     )
+
+
+_AO_PREVIEW = None                     # None = off, else session restore data
+_AO_PREVIEW_PREFIX = "GLB_AO_Preview"  # reserved material name prefix
+_AO_PREVIEW_SAMPLES = 32               # calibrated on real content vs the bake
+
+
+def _ao_preview_mat(name, no_receive, no_cast, distance):
+    """One of the 4 white preview materials, rebuilt fresh each start."""
+    mat = bpy.data.materials.get(name)
+    if mat is None:
+        mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new('ShaderNodeOutputMaterial')
+    out.location = (250, 0)
+    if no_receive:
+        rgb = nt.nodes.new('ShaderNodeRGB')
+        rgb.outputs[0].default_value = (1, 1, 1, 1)
+        nt.links.new(rgb.outputs[0], out.inputs['Surface'])
+    else:
+        ao = nt.nodes.new('ShaderNodeAmbientOcclusion')
+        ao.samples = _AO_PREVIEW_SAMPLES
+        ao.inputs['Distance'].default_value = distance
+        nt.links.new(ao.outputs['Color'], out.inputs['Surface'])
+    if no_cast:
+        mat.blend_method = 'BLEND'
+        if hasattr(mat, 'surface_render_method'):
+            mat.surface_render_method = 'BLENDED'
+    else:
+        mat.blend_method = 'OPAQUE'
+        if hasattr(mat, 'surface_render_method'):
+            mat.surface_render_method = 'DITHERED'
+    return mat
+
+
+def _find_single_principled(mat):
+    """The bake supports exactly one top-level Principled - same rule here."""
+    if not mat or not mat.use_nodes or not mat.node_tree:
+        return None
+    ps = [n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED']
+    return ps[0] if len(ps) == 1 else None
+
+
+def _update_ao_preview_distance(self, context):
+    """Live: AO Distance slider writes into every preview material's AO node."""
+    if _AO_PREVIEW:
+        for mat in bpy.data.materials:
+            if mat.name.startswith(_AO_PREVIEW_PREFIX) and mat.use_nodes:
+                for n in mat.node_tree.nodes:
+                    if n.type == 'AMBIENT_OCCLUSION':
+                        n.inputs['Distance'].default_value = self.ao_distance
+
+
+def ao_preview_start(context, mode, warnings_out):
+    """Swap materials for preview ones. mode = 'WHITE' or 'TEXTURED'."""
+    global _AO_PREVIEW
+    props = context.scene.glb_export_props
+    d = props.ao_distance
+
+    # sweep unused leftovers from a crashed previous session (prefix only)
+    for m in list(bpy.data.materials):
+        if m.name.startswith(_AO_PREVIEW_PREFIX) and m.users == 0:
+            bpy.data.materials.remove(m)
+
+    m_norm = _ao_preview_mat(_AO_PREVIEW_PREFIX, False, False, d)
+    m_nocast = _ao_preview_mat(_AO_PREVIEW_PREFIX + "_NoCast", False, True, d)
+    m_white = _ao_preview_mat(_AO_PREVIEW_PREFIX + "_White", True, False, d)
+    m_white_nc = _ao_preview_mat(_AO_PREVIEW_PREFIX + "_White_NoCast", True, True, d)
+    created = {m_norm.name, m_nocast.name, m_white.name, m_white_nc.name}
+
+    flags = {}
+    if props.ao_use_exceptions:
+        for e in props.ao_exception_objects:
+            if e.object_ref and (e.no_cast or e.no_receive):
+                flags[e.object_ref.name] = (e.no_cast, e.no_receive)
+
+    tx_cache = {}
+
+    def textured_variant(orig, nc, nr):
+        # duplicate of the real material; AO node injected inline before
+        # Base Color (previous input rewired into the AO node's Color)
+        key = (orig.name, nc, nr)
+        if key in tx_cache:
+            return tx_cache[key]
+        dup = orig.copy()
+        dup.name = f"{_AO_PREVIEW_PREFIX}_TX_{orig.name}"
+        created.add(dup.name)
+        if not nr:
+            pr = _find_single_principled(dup)
+            nt = dup.node_tree
+            ao = nt.nodes.new('ShaderNodeAmbientOcclusion')
+            ao.samples = _AO_PREVIEW_SAMPLES
+            ao.inputs['Distance'].default_value = d
+            ao.location = (pr.location.x - 240, pr.location.y + 60)
+            bc = pr.inputs['Base Color']
+            if bc.is_linked:
+                link = bc.links[0]
+                src = link.from_socket
+                nt.links.remove(link)
+                nt.links.new(src, ao.inputs['Color'])
+            else:
+                c = bc.default_value
+                ao.inputs['Color'].default_value = (c[0], c[1], c[2], 1.0)
+            nt.links.new(ao.outputs['Color'], bc)
+        if nc:
+            dup.blend_method = 'BLEND'
+            if hasattr(dup, 'surface_render_method'):
+                dup.surface_render_method = 'BLENDED'
+        tx_cache[key] = dup
+        return dup
+
+    st = {"mode": mode, "objects": [], "created": created,
+          "fast_gi": context.scene.eevee.use_fast_gi, "shading": []}
+    fallback = []
+    for obj in context.view_layer.objects:
+        if obj.type != 'MESH' or not obj.visible_get():
+            continue
+        nc, nr = flags.get(obj.name, (False, False))
+        white = (m_white_nc if (nc and nr) else m_white if nr
+                 else m_nocast if nc else m_norm)
+        orig = [s.material.name if s.material else None for s in obj.material_slots]
+        added = False
+        if not obj.material_slots:
+            obj.data.materials.append(white)
+            added = True
+        elif mode == 'WHITE':
+            for slot in obj.material_slots:
+                slot.material = white
+        else:  # TEXTURED
+            fell = False
+            for slot in obj.material_slots:
+                src = slot.material
+                if src is None or (not nr and _find_single_principled(src) is None):
+                    slot.material = white
+                    fell = fell or (src is not None)
+                else:
+                    slot.material = textured_variant(src, nc, nr)
+            if fell:
+                fallback.append(obj.name)
+        st["objects"].append((obj.name, orig, added))
+
+    context.scene.eevee.use_fast_gi = True
+    for area in context.screen.areas:
+        if area.type == 'VIEW_3D':
+            sh = area.spaces.active.shading
+            if sh.type != 'MATERIAL':
+                st["shading"].append((area.as_pointer(), sh.type))
+                sh.type = 'MATERIAL'
+    _AO_PREVIEW = st
+    if warnings_out is not None and fallback:
+        warnings_out.append("No single Principled BSDF, shown as white AO: "
+                            + ", ".join(sorted(set(fallback))[:8]))
+
+
+def ao_preview_stop(context):
+    """Restore every slot, setting and shading; delete only session materials."""
+    global _AO_PREVIEW
+    st = _AO_PREVIEW
+    _AO_PREVIEW = None
+    if not st:
+        return
+    for obj_name, mats, added in st["objects"]:
+        obj = bpy.data.objects.get(obj_name)
+        if obj is None:
+            continue
+        try:
+            if added:
+                obj.data.materials.clear()
+            else:
+                for i, mname in enumerate(mats):
+                    if i < len(obj.material_slots):
+                        obj.material_slots[i].material = (
+                            bpy.data.materials.get(mname) if mname else None)
+        except Exception:
+            pass
+    try:
+        context.scene.eevee.use_fast_gi = st["fast_gi"]
+    except Exception:
+        pass
+    for area_ptr, prev_type in st["shading"]:
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.as_pointer() == area_ptr and area.type == 'VIEW_3D':
+                    area.spaces.active.shading.type = prev_type
+    for mname in list(st.get("created", [])):
+        mat = bpy.data.materials.get(mname)
+        if mat and mat.users == 0:
+            bpy.data.materials.remove(mat)
+
+
+def ao_preview_refresh(context):
+    """Re-apply the running preview (used by live exception toggles)."""
+    st = _AO_PREVIEW
+    if not st:
+        return
+    mode = st["mode"]
+    ao_preview_stop(context)
+    ao_preview_start(context, mode, None)
+
+
+from bpy.app.handlers import persistent
+
+
+@persistent
+def _ao_preview_autostop(*args):
+    # Safety: stop before save / on undo, redo, render, file load
+    global _AO_PREVIEW
+    try:
+        ao_preview_stop(bpy.context)
+    except Exception:
+        _AO_PREVIEW = None
+
+
+def _ao_preview_toggle(context, op, mode):
+    if _AO_PREVIEW:
+        same = _AO_PREVIEW.get("mode") == mode
+        ao_preview_stop(context)
+        if same:
+            for w in context.window_manager.windows:
+                for a in w.screen.areas:
+                    a.tag_redraw()
+            return {'FINISHED'}
+    warns = []
+    ao_preview_start(context, mode, warns)
+    for w in warns:
+        op.report({'WARNING'}, w)
+    for w in context.window_manager.windows:
+        for a in w.screen.areas:
+            a.tag_redraw()
+    return {'FINISHED'}
+
+
+class GLB_OT_AOPreviewToggle(Operator):
+    bl_idname = "glb_export.ao_preview"
+    bl_label = "Preview AO"
+    bl_description = ("Live white AO preview in Material Preview, honoring AO "
+                      "Distance and the exception flags. Click again to restore")
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        return _ao_preview_toggle(context, self, 'WHITE')
+
+
+class GLB_OT_AOPreviewTexturedToggle(Operator):
+    bl_idname = "glb_export.ao_preview_textured"
+    bl_label = "Preview AO Textured"
+    bl_description = ("Live AO preview on top of the original textures "
+                      "(AO injected before Base Color on duplicates). "
+                      "Click again to restore")
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        return _ao_preview_toggle(context, self, 'TEXTURED')
 
 
 class GLBAlphaCollectionItem(PropertyGroup):
@@ -1276,9 +1553,9 @@ class GLBExportProperties(PropertyGroup):
         name="Rotation Method",
         description="Rotation method for islands",
         items=[
-            ('AXIS_ALIGNED', 'Axis-aligned (Vertical)', 'Align islands to vertical axis'),
-            ('AXIS_ALIGNED_HORIZONTAL', 'Axis-aligned (Horizontal)', 'Align islands to horizontal axis'),
-            ('ANY', 'Any', 'Allow any rotation for optimal packing')
+            ('AXIS_ALIGNED', 'Axis-aligned', 'Rotate islands to the nearest axis'),
+            ('AXIS_ALIGNED_X', 'Axis-aligned (Horizontal)', 'Align islands to the horizontal axis'),
+            ('AXIS_ALIGNED_Y', 'Axis-aligned (Vertical)', 'Align islands to the vertical axis')
         ],
         default='AXIS_ALIGNED'
     )
@@ -1500,7 +1777,8 @@ class GLBExportProperties(PropertyGroup):
         default=0.1,
         min=0.0,
         max=100.0,
-        subtype='DISTANCE'
+        subtype='DISTANCE',
+        update=_update_ao_preview_distance
     )
     
     show_ao_exceptions: BoolProperty(default=False)
@@ -1508,7 +1786,8 @@ class GLBExportProperties(PropertyGroup):
     ao_use_exceptions: BoolProperty(
         name="AO Exceptions",
         description="Objects in the list will not cast ambient occlusion onto other objects",
-        default=False
+        default=False,
+        update=_ao_flag_update
     )
 
     ao_exception_objects: CollectionProperty(type=GLBAOExceptionItem)
@@ -1646,6 +1925,7 @@ class GLB_OT_ProcessAndExport(Operator):
         import time as _time
         self._t_start = _time.time()
         self._exported_files = []
+        ao_preview_stop(context)
         collections_to_process = []
         
         self.original_exclude_states = {}
@@ -2210,7 +2490,7 @@ class GLB_OT_ProcessAndExport(Operator):
                     
                     try:
                         smart_uv_kwargs = {
-                            'angle_limit': props.uv_angle_limit,
+                            'angle_limit': math.radians(props.uv_angle_limit),
                             'island_margin': props.uv_island_margin,
                             'area_weight': props.uv_area_weight,
                             'correct_aspect': props.uv_correct_aspect,
@@ -4076,7 +4356,18 @@ class GLB_PT_ExportPanel(Panel):
                     btn_col.operator("glb_export.add_ao_exception", icon='ADD', text="")
                     btn_col.operator("glb_export.remove_ao_exception", icon='REMOVE', text="")
 
+                prow = box.row(align=True)
+                on_w = bool(_AO_PREVIEW and _AO_PREVIEW.get("mode") == 'WHITE')
+                on_t = bool(_AO_PREVIEW and _AO_PREVIEW.get("mode") == 'TEXTURED')
+                prow.operator("glb_export.ao_preview",
+                              text="Stop Preview" if on_w else "Preview AO",
+                              icon='SHADING_SOLID', depress=on_w)
+                prow.operator("glb_export.ao_preview_textured",
+                              text="Stop Preview" if on_t else "Preview Textured",
+                              icon='SHADING_TEXTURE', depress=on_t)
+
             if props.enable_baking:
+                box.separator()
                 row = box.row(align=True)
                 row.prop(props, "show_alpha_mode",
                          icon='TRIA_DOWN' if props.show_alpha_mode else 'TRIA_RIGHT',
@@ -4649,6 +4940,8 @@ classes = (
     GLB_OT_UnwrapCancel,
     GLB_OT_ShowExportReport,
     GLB_OT_HalveDouble,
+    GLB_OT_AOPreviewToggle,
+    GLB_OT_AOPreviewTexturedToggle,
     GLB_UL_AOExceptions,
     GLB_OT_AddAOException,
     GLB_OT_RemoveAOException,
@@ -4669,6 +4962,11 @@ classes = (
 )
 
 def register():
+    for handler_list in (bpy.app.handlers.save_pre, bpy.app.handlers.undo_post,
+                         bpy.app.handlers.redo_post, bpy.app.handlers.render_init,
+                         bpy.app.handlers.load_pre):
+        if _ao_preview_autostop not in handler_list:
+            handler_list.append(_ao_preview_autostop)
     for cls in classes:
         bpy.utils.register_class(cls)
     
@@ -4691,6 +4989,15 @@ def register():
         print("=" * 60)
 
 def unregister():
+    for handler_list in (bpy.app.handlers.save_pre, bpy.app.handlers.undo_post,
+                         bpy.app.handlers.redo_post, bpy.app.handlers.render_init,
+                         bpy.app.handlers.load_pre):
+        if _ao_preview_autostop in handler_list:
+            handler_list.remove(_ao_preview_autostop)
+    try:
+        ao_preview_stop(bpy.context)
+    except Exception:
+        pass
     global _nbake_draw_handle
     if _nbake_draw_handle:
         bpy.types.SpaceView3D.draw_handler_remove(_nbake_draw_handle, 'WINDOW')
