@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 5, 1),
+    "version": (1, 5, 2),
     "blender": (5, 2, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -1152,6 +1152,12 @@ def _ao_flag_update(self, context):
         ao_preview_refresh(context)
 
 
+def _ao_master_update(self, context):
+    # Turning Ambient Occlusion off stops a running AO preview
+    if not self.bake_ambient_occlusion and globals().get('_AO_PREVIEW'):
+        ao_preview_stop(context)
+
+
 class GLBAOExceptionItem(PropertyGroup):
     object_ref: PointerProperty(
         name="Object",
@@ -1760,7 +1766,8 @@ class GLBExportProperties(PropertyGroup):
     bake_ambient_occlusion: BoolProperty(
         name="Ambient Occlusion",
         description="Add ambient occlusion to materials before baking",
-        default=True
+        default=True,
+        update=_ao_master_update
     )
 
     ao_samples: IntProperty(
