@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 5, 2),
+    "version": (1, 5, 3),
     "blender": (5, 2, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -331,6 +331,103 @@ def _store_export_report(op, time_str):
         print(f"  Verts: {stats['verts']:,} | MaxTex: {stats['max_res']} | "
               f"Textures: {stats['textures']} | Materials: {stats['materials']} | {verdict}")
     print(f"  Time: {time_str}")
+
+
+def material_uses_3d_coords(mat):
+    """True if the material samples Object/Generated coordinates or Geometry
+    Position at the top level (these need per-object correction when baking)."""
+    if not mat or not mat.use_nodes or not mat.node_tree:
+        return False
+    for n in mat.node_tree.nodes:
+        if n.type == 'TEX_COORD' and getattr(n, 'object', None) is None:
+            for oname in ('Object', 'Generated'):
+                out = n.outputs.get(oname)
+                if out and out.is_linked:
+                    return True
+        elif n.type == 'NEW_GEOMETRY':
+            out = n.outputs.get('Position')
+            if out and out.is_linked:
+                return True
+    return False
+
+
+def build_coord_fixed_copy(mat, M, f, center, bbmin, bbdims):
+    """Temporary copy of mat with exact per-object coordinate reconstruction
+    spliced after every Object/Generated/Position output.
+    Pipeline transform: v = R0 * (f*s0*orig) + (f*loc0 - center)
+    Reconstruction:  orig = 1/(f*s0) * R0^-1 * (v + center - f*loc0)"""
+    dup = mat.copy()
+    dup.name = f"{mat.name}_GLBcoord_temp"
+    nt = dup.node_tree
+    loc0 = M.to_translation()
+    rot_inv = M.to_quaternion().inverted().to_euler()
+    s0 = M.to_scale()
+
+    def new_map(x, y, loc=(0, 0, 0), rot=(0, 0, 0), scale=(1, 1, 1)):
+        mp = nt.nodes.new('ShaderNodeMapping')
+        mp.vector_type = 'POINT'
+        mp.inputs['Location'].default_value = loc
+        mp.inputs['Rotation'].default_value = rot
+        mp.inputs['Scale'].default_value = scale
+        mp.location = (x, y)
+        return mp
+
+    for node in list(nt.nodes):
+        outs = []
+        if node.type == 'TEX_COORD':
+            if getattr(node, 'object', None) is not None:
+                continue  # coords come from another object's space - leave untouched
+            for oname in ('Object', 'Generated'):
+                out = node.outputs.get(oname)
+                if out and out.is_linked:
+                    outs.append((out, oname))
+        elif node.type == 'NEW_GEOMETRY':
+            out = node.outputs.get('Position')
+            if out and out.is_linked:
+                outs.append((out, 'Position'))
+        if not outs:
+            continue
+        bx, by = node.location
+        row = 0
+        for out, kind in outs:
+            consumers = [l.to_socket for l in out.links]
+            for l in list(out.links):
+                nt.links.remove(l)
+            y = by - 220 * row
+            row += 1
+            if kind == 'Position':
+                # original world position = (v + center) / f
+                m = new_map(bx + 200, y,
+                            loc=(center[0] / f, center[1] / f, center[2] / f),
+                            scale=(1 / f, 1 / f, 1 / f))
+                nt.links.new(out, m.inputs['Vector'])
+                src = m.outputs['Vector']
+            else:
+                m1 = new_map(bx + 200, y, loc=(center[0] - f * loc0.x,
+                                               center[1] - f * loc0.y,
+                                               center[2] - f * loc0.z))
+                m2 = new_map(bx + 380, y, rot=tuple(rot_inv))
+                m3 = new_map(bx + 560, y, scale=(1 / (f * s0.x),
+                                                 1 / (f * s0.y),
+                                                 1 / (f * s0.z)))
+                # the reconstruction chain always takes the POSITION as input
+                # (TexCoord's Object output), even when correcting Generated
+                nt.links.new(node.outputs['Object'], m1.inputs['Vector'])
+                nt.links.new(m1.outputs['Vector'], m2.inputs['Vector'])
+                nt.links.new(m2.outputs['Vector'], m3.inputs['Vector'])
+                src = m3.outputs['Vector']
+                if kind == 'Generated':
+                    # normalized position in the object's original bounding box
+                    m4 = new_map(bx + 740, y,
+                                 loc=(-bbmin[0] / bbdims[0],
+                                      -bbmin[1] / bbdims[1],
+                                      -bbmin[2] / bbdims[2]),
+                                 scale=(1 / bbdims[0], 1 / bbdims[1], 1 / bbdims[2]))
+                    nt.links.new(src, m4.inputs['Vector'])
+                    src = m4.outputs['Vector']
+            for sck in consumers:
+                nt.links.new(src, sck)
+    return dup
 
 
 class GLB_UL_CustomUVBakeTargets(UIList):
@@ -2218,6 +2315,16 @@ class GLB_OT_ProcessAndExport(Operator):
 
         print("\n=== CONVERTING ALL TO MESH AND APPLYING MODIFIERS ===")
 
+        # Record each object's original Texture Space BEFORE modifiers are
+        # applied - Generated coordinates are based on the base mesh's space
+        for obj in all_duplicated_objects:
+            data = getattr(obj, "data", None)
+            if data is not None and hasattr(data, "texspace_location"):
+                ts_loc = data.texspace_location
+                ts_size = data.texspace_size
+                obj["_glb_bbox_min"] = [ts_loc[i] - ts_size[i] for i in range(3)]
+                obj["_glb_bbox_dims"] = [max(2 * ts_size[i], 1e-9) for i in range(3)]
+        
         # Convert ALL objects to mesh (this applies modifiers on mesh objects)
         for obj in all_duplicated_objects:
             bpy.context.view_layer.objects.active = obj
@@ -2260,7 +2367,7 @@ class GLB_OT_ProcessAndExport(Operator):
                 for obj in all_duplicated_objects:
                     # Store values needed to compensate Texture Coordinate during bake
                     obj["_glb_max_dim"] = max_dimension
-                    obj["_glb_loc_before_transform"] = list(obj.location)
+                    obj["_glb_matrix_world"] = [v for row in obj.matrix_world for v in row]
                     
                     obj.scale *= scale_factor
                     obj.location *= scale_factor
@@ -2288,7 +2395,27 @@ class GLB_OT_ProcessAndExport(Operator):
                 print(f"Centered at origin")
         
         print("=== ALL COLLECTIONS DUPLICATED, SCALED AND VISIBLE ===")
-        
+
+    def apply_coord_fix_copies(self, obj):
+        """Swap materials using 3D coordinates for corrected temp copies,
+        using THIS object's own recorded transform (must run before join)."""
+        from mathutils import Matrix
+        vals = list(obj.get("_glb_matrix_world") or [])
+        max_dim = obj.get("_glb_max_dim")
+        f = (1.0 / float(max_dim)) if max_dim else None
+        center = obj.get("_glb_center")
+        if not vals or not f or center is None:
+            return
+        M = Matrix([vals[0:4], vals[4:8], vals[8:12], vals[12:16]])
+        bbmin = list(obj.get("_glb_bbox_min") or (0.0, 0.0, 0.0))
+        bbdims = [d if abs(d) > 1e-9 else 1.0
+                  for d in (obj.get("_glb_bbox_dims") or (1.0, 1.0, 1.0))]
+        for slot in obj.material_slots:
+            if (slot.material and "_GLBcoord_temp" not in slot.material.name
+                    and material_uses_3d_coords(slot.material)):
+                slot.material = build_coord_fixed_copy(
+                    slot.material, M, float(f), list(center), bbmin, bbdims)
+
     def process_temp_collection(self, context, temp_collection, original_name, current_idx, total_count):
         props = context.scene.glb_export_props
         
@@ -2346,6 +2473,11 @@ class GLB_OT_ProcessAndExport(Operator):
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
             bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+        
+        # Per-object coordinate correction BEFORE joining, so each object's
+        # procedural patterns bake with its own transform values
+        for obj in mesh_objects:
+            self.apply_coord_fix_copies(obj)
         
         self.update_progress(context, "Joining meshes...", current_idx, total_count)
         
@@ -2651,11 +2783,6 @@ class GLB_OT_ProcessAndExport(Operator):
                         
                         y_offset = 300
                         
-                        # Inject Mapping nodes to compensate for the addon's scale + center
-                        # transforms, so procedural textures using Texture Coordinate -> Object
-                        # (or Geometry -> Position) bake at original size on the joined object.
-                        coord_splices = self.inject_coord_compensation(joined_obj)
-                        
                         if bake_data['color']['needs_baking']:
                             print("Baking color...")
                             color_image = self.create_image(f"{joined_obj.name}_Color", props.bake_resolution, 'sRGB')
@@ -2754,10 +2881,6 @@ class GLB_OT_ProcessAndExport(Operator):
                                 ao_part.data.materials.clear()
                                 ao_part.data.materials.append(new_mat)
                         
-                        # Remove the injected Mapping nodes from the source materials.
-                        # joined_obj's material slots will be replaced by new_mat below,
-                        # but the source materials still live in bpy.data.materials.
-                        self.remove_coord_compensation(coord_splices)
                         self.end_uv_safe_bake(joined_obj, uv_state)
                         
                         joined_obj.data.materials.clear()
@@ -2787,11 +2910,6 @@ class GLB_OT_ProcessAndExport(Operator):
                     print(f"Error during baking: {str(e)}")
                     
                     # If a bake threw mid-way, clean up any Mapping splices we injected
-                    try:
-                        self.remove_coord_compensation(coord_splices)
-                    except (NameError, Exception):
-                        pass
-
                     try:
                         self.end_uv_safe_bake(joined_obj, uv_state)
                     except (NameError, Exception):
@@ -3189,109 +3307,6 @@ class GLB_OT_ProcessAndExport(Operator):
 
                     links.new(value_node.outputs['Value'], alpha_input)
                     print(f"   - Created Value node for {mat.name}: {alpha_input.default_value}")
-    
-    def inject_coord_compensation(self, obj):
-        """Inject Mapping nodes after every Texture Coordinate -> Object output, so that
-        procedural textures (Brick, Noise, etc.) using object coordinates bake at the
-        original scale and alignment despite the addon's scale/center transforms.
-        Returns a list of splice records to be undone by remove_coord_compensation()."""
-        max_dim = obj.get("_glb_max_dim")
-        loc_before = obj.get("_glb_loc_before_transform")
-        center = obj.get("_glb_center")
-        
-        if not max_dim or not loc_before or not center:
-            return []
-        
-        # Compensation math (Mapping in Point mode does: out = scale * in + location):
-        #   current_local = (orig_local + loc_before) * (1/max_dim) - center
-        #   we want output = orig_local
-        #   => scale = max_dim, location = max_dim * center - loc_before
-        comp_scale = (float(max_dim), float(max_dim), float(max_dim))
-        comp_location = (
-            float(max_dim) * center[0] - loc_before[0],
-            float(max_dim) * center[1] - loc_before[1],
-            float(max_dim) * center[2] - loc_before[2],
-        )
-        
-        splices = []
-        materials = [slot.material for slot in obj.material_slots
-                     if slot.material and slot.material.use_nodes]
-        
-        # Outputs that carry world/local positional data and get distorted by the
-        # addon's scale/center transforms. Other coordinate sources are left alone:
-        #   Generated     -> auto-normalizes to the mesh bbox (scale-invariant)
-        #   Normal        -> direction vector (scale-invariant)
-        #   UV            -> 2D, already in [0,1]
-        #   Camera/Window/Reflection -> view-dependent, not mesh-dependent
-        compensation_targets = {
-            'TEX_COORD': ('Object',),
-            'NEW_GEOMETRY': ('Position',),
-        }
-        
-        for mat in materials:
-            nodes = mat.node_tree.nodes
-            links = mat.node_tree.links
-            
-            for src_node in list(nodes):
-                output_names = compensation_targets.get(src_node.type)
-                if not output_names:
-                    continue
-                
-                for out_name in output_names:
-                    out_socket = src_node.outputs.get(out_name)
-                    if not out_socket or not out_socket.is_linked:
-                        continue
-                    
-                    # Snapshot existing consumers before we modify links
-                    original_targets = [link.to_socket for link in out_socket.links]
-                    
-                    # Create a Mapping node and route all consumers through it
-                    mapping_node = nodes.new('ShaderNodeMapping')
-                    mapping_node.vector_type = 'POINT'
-                    mapping_node.label = "_glb_compensation"
-                    mapping_node.location = (src_node.location.x + 200, src_node.location.y - 100)
-                    mapping_node.inputs['Scale'].default_value = comp_scale
-                    mapping_node.inputs['Location'].default_value = comp_location
-                    
-                    # Disconnect originals, route through Mapping, reconnect downstream
-                    for link in list(out_socket.links):
-                        links.remove(link)
-                    links.new(out_socket, mapping_node.inputs['Vector'])
-                    for to_socket in original_targets:
-                        links.new(mapping_node.outputs['Vector'], to_socket)
-                    
-                    splices.append({
-                        'material': mat,
-                        'mapping_node': mapping_node,
-                        'src_socket': out_socket,
-                        'targets': original_targets,
-                    })
-        
-        return splices
-    
-    def remove_coord_compensation(self, splices):
-        """Undo inject_coord_compensation: remove Mapping nodes and reconnect originals."""
-        for splice in splices:
-            try:
-                mat = splice['material']
-                mapping_node = splice['mapping_node']
-                src_socket = splice['src_socket']
-                targets = splice['targets']
-                links = mat.node_tree.links
-                
-                # Drop links touching the Mapping node
-                for link in list(mapping_node.inputs['Vector'].links):
-                    links.remove(link)
-                for link in list(mapping_node.outputs['Vector'].links):
-                    links.remove(link)
-                
-                # Reconnect src directly to original consumers
-                for to_socket in targets:
-                    links.new(src_socket, to_socket)
-                
-                mat.node_tree.nodes.remove(mapping_node)
-            except Exception as e:
-                print(f"Warning: failed to remove coord compensation splice: {e}")
 
     def get_principled_node(self, material):
         """Find Principled BSDF node in material"""
