@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 5, 3),
+    "version": (1, 5, 4),
     "blender": (5, 2, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -2540,7 +2540,9 @@ class GLB_OT_ProcessAndExport(Operator):
                             bpy.ops.object.join()
                         joined_obj = context.active_object
                         joined_obj.name = original_name
-                        if "UVMap" in joined_obj.data.uv_layers:
+                        if "GLB_Bake" in joined_obj.data.uv_layers:
+                            joined_obj.data.uv_layers.active = joined_obj.data.uv_layers["GLB_Bake"]
+                        elif "UVMap" in joined_obj.data.uv_layers:
                             joined_obj.data.uv_layers.active = joined_obj.data.uv_layers["UVMap"]
                         custom_uv_peeled = []  # already merged
 
@@ -2647,6 +2649,14 @@ class GLB_OT_ProcessAndExport(Operator):
             # Merge custom-UV objects into the main object BEFORE packing,
             # so the whole collection shares one UV map -> one material
             if custom_uv_peeled and joined_obj and joined_obj.name in bpy.data.objects:
+                # Customs carry their pinned layout in 'GLB_Bake'; make sure the
+                # main part has that layer too (as a copy of its current active
+                # layout) so packing and baking operate on one shared layer
+                if "GLB_Bake" not in joined_obj.data.uv_layers:
+                    new_bake = joined_obj.data.uv_layers.new(name="GLB_Bake")
+                    if new_bake is not None:
+                        joined_obj.data.uv_layers.active = new_bake
+                        
                 if props.uv_unwrap_method == 'MOF' and not custom_bake_only:
                     # Normalize auto-island scale BEFORE customs join in,
                     # so the chosen layouts keep their own island proportions
@@ -3748,48 +3758,76 @@ class GLB_OT_ProcessAndExport(Operator):
         joined_obj.select_set(True)
         context.view_layer.objects.active = joined_obj
 
+    def pin_implicit_uv_readers(self, pobj, rname):
+        """Permanently wire this object's implicit UV readers (empty UV Map
+        nodes, Texture Coordinate UV outputs, image textures with an unlinked
+        Vector socket) to its own render UV map BY NAME, so texture sampling
+        stays correct after the join no matter which layer becomes
+        active / render-active for packing and baking."""
+        for slot in pobj.material_slots:
+            mat = slot.material
+            if not mat or not mat.use_nodes:
+                continue
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+            for node in list(nodes):
+                if node.type == 'UVMAP' and node.uv_map == "":
+                    node.uv_map = rname
+                elif node.type == 'TEX_COORD':
+                    uv_out = node.outputs.get('UV')
+                    if uv_out and uv_out.is_linked:
+                        pin = nodes.new('ShaderNodeUVMap')
+                        pin.uv_map = rname
+                        pin.label = "_glb_custom_uv_pin"
+                        pin.location = (node.location.x + 180, node.location.y - 160)
+                        consumers = [l.to_socket for l in uv_out.links]
+                        for l in list(uv_out.links):
+                            links.remove(l)
+                        for s in consumers:
+                            links.new(pin.outputs['UV'], s)
+                elif node.type == 'TEX_IMAGE':
+                    vec = node.inputs.get('Vector')
+                    if vec and not vec.is_linked:
+                        pin = nodes.new('ShaderNodeUVMap')
+                        pin.uv_map = rname
+                        pin.label = "_glb_custom_uv_pin"
+                        pin.location = (node.location.x - 250, node.location.y)
+                        links.new(pin.outputs['UV'], vec)
+
     def prepare_custom_uv_object(self, joined_obj, pobj, uv_name):
-        """Prepare a custom-UV object for merging into the main object:
-        its chosen UV map becomes a pinned layer named 'UVMap' (the bake
-        layer), so the packer preserves its island rotation."""
+        """Prepare a custom-UV object for merging into the main object.
+        The chosen UV map is copied into a pinned layer named 'GLB_Bake'
+        (the layer that gets packed and baked), while the object's own
+        render layer keeps its name and coordinates so its materials
+        still sample their textures correctly after the join."""
         mesh = pobj.data
         if uv_name not in mesh.uv_layers:
             if mesh.uv_layers.active is None:
                 return
             uv_name = mesh.uv_layers.active.name
-        
-        # Align default-sampling layer name with the main object's render layer,
-        # so textures on this object still sample correctly after the join
-        if joined_obj is not None:
-            render_name = next((l.name for l in joined_obj.data.uv_layers if l.active_render), None)
-            if render_name and render_name != "UVMap" and render_name not in mesh.uv_layers:
-                p_render = next((l for l in mesh.uv_layers if l.active_render), None)
-                if p_render is not None:
-                    if uv_name == p_render.name:
-                        uv_name = render_name
-                    p_render.name = render_name
-        
-        # Free up the name "UVMap" for the bake layer (unless the chosen map IS "UVMap")
-        if "UVMap" in mesh.uv_layers and uv_name != "UVMap":
-            existing = [l.name for l in mesh.uv_layers]
-            n = 1
-            while f"UVMap_C{n:02d}" in existing:
-                n += 1
-            mesh.uv_layers["UVMap"].name = f"UVMap_C{n:02d}"
-        
-        if uv_name == "UVMap":
-            bake_layer = mesh.uv_layers["UVMap"]
+
+        # Keep implicit texture sampling on this object's own render map
+        p_render = next((l for l in mesh.uv_layers if l.active_render), None)
+        rname = p_render.name if p_render else uv_name
+        self.pin_implicit_uv_readers(pobj, rname)
+
+        # Copy the chosen map into the shared bake/pack layer 'GLB_Bake'
+        src = mesh.uv_layers[uv_name]
+        src_uvs = [0.0] * (len(mesh.loops) * 2)
+        src.data.foreach_get("uv", src_uvs)
+        if "GLB_Bake" in mesh.uv_layers:
+            bake_layer = mesh.uv_layers["GLB_Bake"]
         else:
-            src = mesh.uv_layers[uv_name]
-            src_uvs = [0.0] * (len(mesh.loops) * 2)
-            src.data.foreach_get("uv", src_uvs)
-            bake_layer = mesh.uv_layers.new(name="UVMap", do_init=False)
-            bake_layer.data.foreach_set("uv", src_uvs)
-        
+            bake_layer = mesh.uv_layers.new(name="GLB_Bake", do_init=False)
+        if bake_layer is None:
+            print(f"Warning: could not add GLB_Bake layer on {pobj.name} (UV map limit reached); island layout may change")
+            return
+        bake_layer.data.foreach_set("uv", src_uvs)
+
         # Pin every UV so the packer preserves island rotation
         for d in bake_layer.data:
             d.pin_uv = True
-        
+
         mesh.uv_layers.active = bake_layer
 
     def merge_deferred_ao_parts(self, context):
