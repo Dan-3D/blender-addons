@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 5, 4),
+    "version": (1, 5, 5),
     "blender": (5, 2, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -333,9 +333,16 @@ def _store_export_report(op, time_str):
     print(f"  Time: {time_str}")
 
 
+_IMPLICIT_GENERATED_TEXTURES = {
+    'TEX_NOISE', 'TEX_MAGIC', 'TEX_WAVE', 'TEX_VORONOI', 'TEX_GRADIENT',
+    'TEX_CHECKER', 'TEX_BRICK', 'TEX_WHITE_NOISE',
+}
+
+
 def material_uses_3d_coords(mat):
     """True if the material samples Object/Generated coordinates or Geometry
-    Position at the top level (these need per-object correction when baking)."""
+    Position at the top level, including procedural textures whose UNLINKED
+    Vector input implicitly means Generated coordinates."""
     if not mat or not mat.use_nodes or not mat.node_tree:
         return False
     for n in mat.node_tree.nodes:
@@ -348,6 +355,10 @@ def material_uses_3d_coords(mat):
             out = n.outputs.get('Position')
             if out and out.is_linked:
                 return True
+        elif (n.type in _IMPLICIT_GENERATED_TEXTURES
+                and n.inputs.get('Vector') is not None
+                and not n.inputs['Vector'].is_linked):
+            return True
     return False
 
 
@@ -427,6 +438,33 @@ def build_coord_fixed_copy(mat, M, f, center, bbmin, bbdims):
                     src = m4.outputs['Vector']
             for sck in consumers:
                 nt.links.new(src, sck)
+
+    # Procedural textures with an UNLINKED Vector implicitly use Generated
+    # coordinates - feed them the corrected Generated explicitly
+    implicit = [n for n in nt.nodes
+                if n.type in _IMPLICIT_GENERATED_TEXTURES
+                and n.inputs.get('Vector') is not None
+                and not n.inputs['Vector'].is_linked]
+    if implicit:
+        bx = min(n.location.x for n in implicit) - 1150
+        by = max(n.location.y for n in implicit) + 260
+        tc = nt.nodes.new('ShaderNodeTexCoord')
+        tc.location = (bx, by)
+        m1 = new_map(bx + 200, by, loc=(center[0] - f * loc0.x,
+                                        center[1] - f * loc0.y,
+                                        center[2] - f * loc0.z))
+        m2 = new_map(bx + 380, by, rot=tuple(rot_inv))
+        m3 = new_map(bx + 560, by, scale=(1 / (f * s0.x), 1 / (f * s0.y), 1 / (f * s0.z)))
+        m4 = new_map(bx + 740, by, loc=(-bbmin[0] / bbdims[0],
+                                        -bbmin[1] / bbdims[1],
+                                        -bbmin[2] / bbdims[2]),
+                     scale=(1 / bbdims[0], 1 / bbdims[1], 1 / bbdims[2]))
+        nt.links.new(tc.outputs['Object'], m1.inputs['Vector'])
+        nt.links.new(m1.outputs['Vector'], m2.inputs['Vector'])
+        nt.links.new(m2.outputs['Vector'], m3.inputs['Vector'])
+        nt.links.new(m3.outputs['Vector'], m4.inputs['Vector'])
+        for n in implicit:
+            nt.links.new(m4.outputs['Vector'], n.inputs['Vector'])
     return dup
 
 
