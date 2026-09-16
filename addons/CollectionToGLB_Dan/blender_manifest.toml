@@ -5,7 +5,7 @@ version = "1.5.5"
 tagline = "Export collections as GLB with automatic scaling and transforms"
 maintainer = "Daniel Marcin from 3D Content Team (Prompted in Claude AI)"
 type = "add-on"
-blender_version_min = "5.2.0"
+blender_version_min = "5.1.0"
 license = ["SPDX:GPL-3.0-or-later"]
 
 [permissions]
