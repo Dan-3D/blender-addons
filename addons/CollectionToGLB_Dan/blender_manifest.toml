@@ -1,11 +1,11 @@
 schema_version = "1.0.0"
 id = "collectiontoglb_dan"
 name = "Collection(s) to GLB"
-version = "1.5.5"
+version = "1.5.6"
 tagline = "Export collections as GLB with automatic scaling and transforms"
 maintainer = "Daniel Marcin from 3D Content Team (Prompted in Claude AI)"
 type = "add-on"
-blender_version_min = "5.2.0"
+blender_version_min = "4.5.0"
 license = ["SPDX:GPL-3.0-or-later"]
 
 [permissions]
