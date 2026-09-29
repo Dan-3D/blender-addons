@@ -110,9 +110,10 @@ jobs:
               """Update existing toml with bl_info values"""
               if 'version' in bl_info:
                   toml_content = re.sub(
-                      r'version\s*=\s*"[^"]+"',
+                      r'^version\s*=\s*"[^"]+"',
                       f'version = "{bl_info["version"]}"',
-                      toml_content
+                      toml_content,
+                      flags=re.MULTILINE
                   )
               
               if 'name' in bl_info:
