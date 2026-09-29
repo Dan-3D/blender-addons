@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 5, 6),
+    "version": (1, 5, 7),
     "blender": (4, 5, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -3052,6 +3052,7 @@ class GLB_OT_ProcessAndExport(Operator):
                 filepath=filepath,
                 export_format='GLB',
                 use_selection=True,
+                export_tangents=True,
                 export_cameras=False,
                 export_lights=False
             )
