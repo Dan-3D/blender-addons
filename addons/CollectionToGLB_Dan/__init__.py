@@ -1,8 +1,8 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 5, 5),
-    "blender": (5, 2, 0),
+    "version": (1, 5, 6),
+    "blender": (4, 5, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
     "category": "Import-Export",
@@ -3406,6 +3406,12 @@ class GLB_OT_ProcessAndExport(Operator):
                 elif node.type == 'UVMAP' and node.uv_map == "":
                     node.uv_map = orig_name
                     state['pins'].append(('EMPTY_UVMAP', mat, node))
+                elif node.type == 'NORMAL_MAP' and node.space == 'TANGENT' and node.uv_map == "":
+                    node.uv_map = orig_name
+                    state['pins'].append(('EMPTY_UVMAP', mat, node))
+                elif node.type == 'TANGENT' and node.direction_type == 'UV_MAP' and node.uv_map == "":
+                    node.uv_map = orig_name
+                    state['pins'].append(('EMPTY_UVMAP', mat, node))
                 elif node.type == 'TEX_COORD':
                     uv_out = node.outputs.get('UV')
                     if uv_out and uv_out.is_linked:
@@ -3810,6 +3816,10 @@ class GLB_OT_ProcessAndExport(Operator):
             links = mat.node_tree.links
             for node in list(nodes):
                 if node.type == 'UVMAP' and node.uv_map == "":
+                    node.uv_map = rname
+                elif node.type == 'NORMAL_MAP' and node.space == 'TANGENT' and node.uv_map == "":
+                    node.uv_map = rname
+                elif node.type == 'TANGENT' and node.direction_type == 'UV_MAP' and node.uv_map == "":
                     node.uv_map = rname
                 elif node.type == 'TEX_COORD':
                     uv_out = node.outputs.get('UV')
