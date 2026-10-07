@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 5, 7),
+    "version": (1, 5, 8),
     "blender": (4, 5, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -42,11 +42,11 @@ def material_has_alpha(mat):
     alpha_input = principled.inputs.get('Alpha')
     if alpha_input is None:
         return False
-    return alpha_input.is_linked or alpha_input.default_value < 1.0
+    return alpha_input.is_linked or alpha_input.default_value < 0.999
 
 
 def collection_has_alpha(coll):
-    for obj in coll.all_objects:
+    for obj in coll.objects:
         if obj.type == 'MESH':
             for slot in obj.material_slots:
                 if material_has_alpha(slot.material):
@@ -2986,15 +2986,29 @@ class GLB_OT_ProcessAndExport(Operator):
                         ao_image = self.create_image(f"{joined_obj.name}_AO", props.bake_resolution, 'Non-Color')
                         ao_image.generated_color = (1.0, 1.0, 1.0, 1.0)
                         self.run_ao_bakes(context, joined_obj, ao_image, ao_parts, main_no_receive)
+                        bake_uv = joined_obj.data.uv_layers.active.name if joined_obj.data.uv_layers.active else None
                         for slot in joined_obj.material_slots:
                             if slot.material:
-                                self.create_gltf_output_node(slot.material, ao_image)
+                                self.create_gltf_output_node(slot.material, ao_image, bake_uv)
                         print(f"AO-only bake complete for {joined_obj.name}")
                     else:
                         print("All geometry is set to No Receive - skipping AO texture")
                 except Exception as e:
                     print(f"AO-only bake failed: {e}")
                     self.report({'WARNING'}, f"AO bake failed for {original_name}: {e}")
+
+            if not props.enable_baking:
+                try:
+                    a_mode, a_thr, a_ds = resolve_alpha_mode(props, original_name)
+                    done = set()
+                    for slot in joined_obj.material_slots:
+                        m = slot.material
+                        if m and m.as_pointer() not in done and material_has_alpha(m):
+                            done.add(m.as_pointer())
+                            apply_alpha_mode(m, a_mode, a_thr, a_ds)
+                            print(f"Alpha mode {a_mode} applied to {m.name}")
+                except Exception as e:
+                    self.report({'WARNING'}, f"Alpha mode failed for {original_name}: {e}")
 
             progress = int((current_idx / total_count) * 100)
             context.workspace.status_text_set(
@@ -4475,28 +4489,27 @@ class GLB_PT_ExportPanel(Panel):
                               text="Stop Preview" if on_t else "Preview Textured",
                               icon='SHADING_TEXTURE', depress=on_t)
 
-            if props.enable_baking:
-                box.separator()
-                row = box.row(align=True)
-                row.prop(props, "show_alpha_mode",
-                         icon='TRIA_DOWN' if props.show_alpha_mode else 'TRIA_RIGHT',
-                         icon_only=True, emboss=False)
-                row.label(text="Alpha Mode")
-                if props.show_alpha_mode:
-                    acol = box.column()
-                    acol.prop(props, "alpha_mode", text="Default")
-                    if props.alpha_mode == 'MASK':
-                        acol.prop(props, "alpha_threshold")
-                    acol.operator("glb_export.scan_alpha_collections", icon='VIEWZOOM')
-                    for item in props.alpha_collections:
-                        if not item.collection_ref:
-                            continue
-                        row = acol.row(align=True)
-                        row.label(text=item.collection_ref.name, icon='OUTLINER_COLLECTION')
-                        row.prop(item, "alpha_mode", text="")
-                        if item.alpha_mode == 'MASK':
-                            row.prop(item, "alpha_threshold", text="")
-                        row.prop(item, "double_sided", text="2-Sided", toggle=True)
+            box.separator()
+            row = box.row(align=True)
+            row.prop(props, "show_alpha_mode",
+                     icon='TRIA_DOWN' if props.show_alpha_mode else 'TRIA_RIGHT',
+                     icon_only=True, emboss=False)
+            row.label(text="Alpha Mode")
+            if props.show_alpha_mode:
+                acol = box.column()
+                acol.prop(props, "alpha_mode", text="Default")
+                if props.alpha_mode == 'MASK':
+                    acol.prop(props, "alpha_threshold")
+                acol.operator("glb_export.scan_alpha_collections", icon='VIEWZOOM')
+                for item in props.alpha_collections:
+                    if not item.collection_ref:
+                        continue
+                    row = acol.row(align=True)
+                    row.label(text=item.collection_ref.name, icon='OUTLINER_COLLECTION')
+                    row.prop(item, "alpha_mode", text="")
+                    if item.alpha_mode == 'MASK':
+                        row.prop(item, "alpha_threshold", text="")
+                    row.prop(item, "double_sided", text="2-Sided", toggle=True)
         
         # Export settings
         layout.separator()
