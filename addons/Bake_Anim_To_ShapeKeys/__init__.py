@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Bake Animation to Shape Keys",
     "author": "adambb-code",
-    "version": (1, 2, 1),
+    "version": (1, 2, 3),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar (N-Panel) > GLB Bake",
     "description": "Bakes complex nested hierarchies and modifiers to shape keys for GLB export.",
@@ -32,6 +32,66 @@ def _action_fcurves(action):
     elif hasattr(action, "fcurves"):
         fc.extend(action.fcurves)
     return fc
+
+
+def _lock_custom_normals(mesh, ev_obj):
+    """Copy the evaluated per-loop normals (e.g. from Weighted Normal modifier)
+    onto *mesh* as persistent custom split normals so they survive modifier removal.
+    """
+    try:
+        cn = [tuple(n.vector) for n in ev_obj.data.corner_normals]
+        if cn:
+            mesh.normals_split_custom_set(cn)
+    except Exception as e:
+        print(f"[lock_normals | {ev_obj.name}] EXCEPTION: {e}")
+
+
+def _mesh_from_object(obj, context):
+    """Get an evaluated mesh from any object type, including GeoNodes that output
+    curve or instance geometry.
+
+    Fast path: new_from_object on the evaluated object — works for regular meshes
+    and GeoNodes that output mesh geometry directly.
+
+    Fallback (0 vertices + NODES modifier): create a *temporary copy* of the object,
+    append a Realize Instances modifier to the COPY (never to obj), evaluate it, then
+    immediately remove the copy.  This avoids invalidating obj's depsgraph, which was
+    the root cause of empty shape key coordinates when the original object was modified.
+    """
+    dg   = context.evaluated_depsgraph_get()
+    ev   = obj.evaluated_get(dg)
+    mesh = bpy.data.meshes.new_from_object(ev)
+    if len(mesh.vertices) > 0 or not any(m.type == 'NODES' for m in obj.modifiers):
+        _lock_custom_normals(mesh, ev)
+        return mesh
+    bpy.data.meshes.remove(mesh)
+
+    # Build (or reuse) a one-node group: GroupInput → RealizeInstances → GroupOutput.
+    _NG = "_bake_realize_instances"
+    ng  = bpy.data.node_groups.get(_NG)
+    if ng is None:
+        ng = bpy.data.node_groups.new(_NG, 'GeometryNodeTree')
+        ng.interface.new_socket('Geometry', in_out='INPUT',  socket_type='NodeSocketGeometry')
+        ng.interface.new_socket('Geometry', in_out='OUTPUT', socket_type='NodeSocketGeometry')
+        _n_in  = ng.nodes.new('NodeGroupInput')
+        _n_ri  = ng.nodes.new('GeometryNodeRealizeInstances')
+        _n_out = ng.nodes.new('NodeGroupOutput')
+        ng.links.new(_n_in.outputs[0], _n_ri.inputs[0])
+        ng.links.new(_n_ri.outputs[0], _n_out.inputs[0])
+
+    # Use a temporary COPY of obj so obj's depsgraph is never invalidated.
+    tmp_obj = obj.copy()
+    context.scene.collection.objects.link(tmp_obj)
+    try:
+        tmp_mod            = tmp_obj.modifiers.new("_bake_realize", 'NODES')
+        tmp_mod.node_group = ng
+        dg2  = context.evaluated_depsgraph_get()
+        ev2  = tmp_obj.evaluated_get(dg2)
+        mesh = bpy.data.meshes.new_from_object(ev2)
+        _lock_custom_normals(mesh, ev2)
+    finally:
+        bpy.data.objects.remove(tmp_obj, do_unlink=True)
+    return mesh
 
 
 def _patch_glb_scale_step(glb_path):
@@ -478,19 +538,8 @@ def _est_poll_tick():
         if sel_key is None:
             return 0.25   # no cache yet — wait until context is available
 
-    # Resolve raw selection → deform object names.
-    # This makes the hash stable when selection flips between objects in the same
-    # hierarchy (e.g. armature ↔ mesh), since both resolve to the same deform set.
-    try:
-        sel_objs = [o for n in (sel_key or ()) if (o := bpy.data.objects.get(n))]
-        deform_key = tuple(sorted(
-            o.name for o in gather_all_targets(sel_objs) if collect_deform_fcurves([o])
-        ))
-    except Exception:
-        deform_key = sel_key or ()
-
     sh = _preview_settings_hash(scene)
-    h = hash((sh, deform_key))
+    h = hash((sh, sel_key))
 
     # Reset debounce countdown on every individual hash change (seen_hash pattern).
     # Immediately flip to 'pending' so draw() can show feedback during the wait.
@@ -549,14 +598,17 @@ def _est_poll_tick():
             deform_objs = [o for o in gather_all_targets(sel) if _est_is_deforming(o)]
             _EST['_deform_objs_cache'] = deform_objs
 
-            # Vertex count for size estimate — evaluate depsgraph so modifiers
-            # (e.g. Subdivision Surface) are applied and the count reflects real geometry.
+            # Vertex count for size estimate — use _mesh_from_object so that
+            # GeoNodes instances (e.g. String to Curve) are realized before counting.
             try:
-                dg_est = bpy.context.evaluated_depsgraph_get()
-                _EST['_total_verts'] = sum(
-                    len(o.evaluated_get(dg_est).data.vertices)
-                    for o in deform_objs if o.type == 'MESH'
-                )
+                _total = 0
+                for _vo in deform_objs:
+                    if _vo.type != 'MESH':
+                        continue
+                    _vm = _mesh_from_object(_vo, bpy.context)
+                    _total += len(_vm.vertices)
+                    bpy.data.meshes.remove(_vm)
+                _EST['_total_verts'] = _total
             except Exception:
                 _EST['_total_verts'] = 0
 
@@ -933,12 +985,26 @@ class OBJECT_OT_glb_shapekey_baker(bpy.types.Operator):
 
                     baked.name = orig.name + "_GLB_Baked"
 
-                    # Convert BEFORE removing modifiers so they get applied to mesh data.
-                    # This handles both non-MESH types and MESH objects with modifiers.
-                    bpy.ops.object.select_all(action='DESELECT')
-                    baked.select_set(True)
-                    context.view_layer.objects.active = baked
-                    bpy.ops.object.convert(target='MESH')
+                    # Evaluate the *original* object to get the correct mesh.
+                    # Using new_from_object on the original is reliable for all
+                    # modifier types including Geometry Nodes with curve/point
+                    # output — bpy.ops.object.convert can silently produce empty
+                    # geometry for those in Blender 5.1.
+                    _init_mesh = _mesh_from_object(orig, context)
+
+                    # If the baked copy is not a MESH (e.g. Curve, Text, Meta)
+                    # we still need to change its type before assigning mesh data.
+                    if baked.type != 'MESH':
+                        bpy.ops.object.select_all(action='DESELECT')
+                        baked.select_set(True)
+                        context.view_layer.objects.active = baked
+                        bpy.ops.object.convert(target='MESH')
+
+                    # Replace the baked object's mesh data with the evaluated result.
+                    _old_data  = baked.data
+                    baked.data = _init_mesh
+                    if _old_data.users == 0:
+                        bpy.data.meshes.remove(_old_data)
 
                     for mod in list(baked.modifiers):
                         baked.modifiers.remove(mod)
@@ -1009,9 +1075,19 @@ class OBJECT_OT_glb_shapekey_baker(bpy.types.Operator):
                 ev = orig.evaluated_get(_dg)
                 # --- mesh deformation check (local-space vertices) ---
                 if orig not in deform_objs and orig.type == 'MESH':
-                    n   = len(ev.data.vertices)
-                    buf = [0.0] * (n * 3)
-                    ev.data.vertices.foreach_get("co", buf)
+                    # GeoNodes may output curve/point geometry — .data.vertices
+                    # is empty in that case.  Use new_from_object instead so the
+                    # result is always a proper mesh regardless of output type.
+                    if any(m.type == 'NODES' for m in orig.modifiers):
+                        _samp_tmp = _mesh_from_object(orig, context)
+                        n   = len(_samp_tmp.vertices)
+                        buf = [0.0] * (n * 3)
+                        _samp_tmp.vertices.foreach_get("co", buf)
+                        bpy.data.meshes.remove(_samp_tmp)
+                    else:
+                        n   = len(ev.data.vertices)
+                        buf = [0.0] * (n * 3)
+                        ev.data.vertices.foreach_get("co", buf)
                     if orig not in _sample_verts:
                         _sample_verts[orig] = (n, buf)
                     else:
@@ -1091,8 +1167,8 @@ class OBJECT_OT_glb_shapekey_baker(bpy.types.Operator):
                     if orig not in bake_map:
                         continue
                     ev  = orig.evaluated_get(dg)
-                    tmp = bpy.data.meshes.new_from_object(ev)
-                    M   = ev.matrix_world
+                    M   = ev.matrix_world.copy()
+                    tmp = _mesh_from_object(orig, context)
                     buf = []
                     for v in tmp.vertices:
                         wco = M @ v.co
@@ -1113,7 +1189,7 @@ class OBJECT_OT_glb_shapekey_baker(bpy.types.Operator):
                     ca = vert_cache[fa].get(orig)
                     cb = vert_cache[fb].get(orig)
                     cm = vert_cache[fm].get(orig)
-                    if not ca or not cb or not cm or len(ca) != len(cm):
+                    if not ca or not cb or not cm or len(ca) != len(cb) or len(ca) != len(cm):
                         continue
                     for i in range(0, len(ca), 3):
                         ex = ca[i]     + t * (cb[i]     - ca[i])     - cm[i]
@@ -1211,10 +1287,54 @@ class OBJECT_OT_glb_shapekey_baker(bpy.types.Operator):
             if anim_end is not None and anim_end > end:
                 end = anim_end
 
+        # Build topo helpers early — needed both for the adaptive topology scan
+        # below and for the segment-setup loop later.
+        _has_nodes_cache = {o: any(m.type == 'NODES' for m in o.modifiers)
+                            for o in deform_objs}
+
+        def _topo_key(orig, mesh):
+            """Topology fingerprint: (n_verts, n_polys, n_edges) + connectivity hash
+            for NODES objects so that same-count but different-connectivity topologies
+            (e.g. '6' vs '9', or any two different GeoNodes string outputs) are
+            treated as distinct segments."""
+            nv  = len(mesh.vertices)
+            np_ = len(mesh.polygons)
+            ne  = len(mesh.edges)
+            if not _has_nodes_cache.get(orig) or nv == 0:
+                return (nv, np_, ne)
+            n_loops = len(mesh.loops)
+            lv_buf  = [0] * n_loops
+            mesh.loops.foreach_get("vertex_index", lv_buf)
+            return (nv, np_, ne, hash(tuple(lv_buf)))
+
         if scene.glb_bake_adaptive:
             bake_frames = build_adaptive_frames(start, end, FRAME_STEP)
             if not bake_frames:
                 bake_frames = list(range(start, end + 1, FRAME_STEP))
+
+            # Topology-change補正: for GeoNodes objects, adaptive may have missed
+            # frames where the string/counter switches to a different character.
+            # Scan all frames at FRAME_STEP and add any frame where the topo_key
+            # changes from the previous frame so every topology boundary is present.
+            _topo_nodes_objs = [o for o in deform_objs
+                                if any(m.type == 'NODES' for m in o.modifiers)]
+            if _topo_nodes_objs:
+                _extra = set()
+                for _tno in _topo_nodes_objs:
+                    _prev_tk = None
+                    for _tf in range(start, end + 1, FRAME_STEP):
+                        scene.frame_set(_tf)
+                        _tk_mesh = _mesh_from_object(_tno, context)
+                        _tk = _topo_key(_tno, _tk_mesh)
+                        bpy.data.meshes.remove(_tk_mesh)
+                        if _prev_tk is not None and _tk != _prev_tk:
+                            _extra.add(_tf)
+                        _prev_tk = _tk
+                if _extra:
+                    bake_frames = sorted(set(bake_frames) | _extra)
+                    self.report({'INFO'},
+                        f"Topology scan added {len(_extra)} boundary frame(s) for GeoNodes objects.")
+
             self.report({'INFO'}, f"Adaptive: {len(bake_frames)} frames (last key at {bake_frames[-1]}).")
         elif scene.glb_bake_auto_range:
             bake_frames = build_smart_frames(list(all_targets), start, end, FRAME_STEP)
@@ -1241,7 +1361,7 @@ class OBJECT_OT_glb_shapekey_baker(bpy.types.Operator):
         # bake_segs[orig] = [(seg_frames, seg_baked, seg_M_ref), ...]
 
         def _setup_seg(orig, seg_frames, seg_baked):
-            """Find first invertible frame, lock world matrix, update Basis. Returns M."""
+            """Find first invertible frame, lock world matrix, rebuild Basis. Returns M."""
             ref_f = seg_frames[0]
             for cand in seg_frames:
                 scene.frame_set(cand)
@@ -1253,16 +1373,18 @@ class OBJECT_OT_glb_shapekey_baker(bpy.types.Operator):
             ev_r  = orig.evaluated_get(context.evaluated_depsgraph_get())
             seg_M = ev_r.matrix_world.copy()
             seg_baked.matrix_world = seg_M
-            tmp = bpy.data.meshes.new_from_object(ev_r)
-            if (seg_baked.data.shape_keys
-                    and 'Basis' in seg_baked.data.shape_keys.key_blocks
-                    and len(tmp.vertices) == len(seg_baked.data.vertices)):
-                coords = []
-                for v in tmp.vertices:
-                    coords.extend(v.co)
-                seg_baked.data.shape_keys.key_blocks["Basis"].data.foreach_set("co", coords)
-                seg_baked.data.update()
-            bpy.data.meshes.remove(tmp)
+            tmp = _mesh_from_object(orig, context)
+
+            # Always replace the mesh data block so the Basis mesh is consistent
+            # with ref_f (vertex positions AND any auto-smooth/sharp data from the
+            # evaluated object at that frame).
+            if seg_baked.data.shape_keys:
+                seg_baked.shape_key_clear()
+            old_data = seg_baked.data
+            seg_baked.data = tmp
+            if old_data.users == 0:
+                bpy.data.meshes.remove(old_data)
+            seg_baked.shape_key_add(name="Basis")
             return seg_M
 
         bake_segs       = {}   # orig → [(seg_frames, seg_baked, seg_M), ...]
@@ -1273,20 +1395,31 @@ class OBJECT_OT_glb_shapekey_baker(bpy.types.Operator):
             primary_baked = bake_map[orig]
 
             # Scan all bake_frames for this object to find topology segments.
-            seg_groups = []          # [(n_verts, [frame, ...]), ...]
-            cur_n, cur_frames = None, []
+            # Uses a multi-tier topology key: (n_verts, n_polys, n_edges) catches
+            # most changes; a coarse spatial hash catches same-count cases like
+            # different digit shapes in a GeoNodes number counter.
+            seg_groups = []          # [(topo_key, [frame, ...]), ...]
+            cur_k, cur_frames = None, []
             for f in bake_frames:
                 scene.frame_set(f)
                 dg = context.evaluated_depsgraph_get()
-                n  = len(orig.evaluated_get(dg).data.vertices)
-                if cur_n is None or n == cur_n:
-                    cur_n = n
+                if _has_nodes_cache.get(orig):
+                    _seg_tmp = _mesh_from_object(orig, context)
+                    k = _topo_key(orig, _seg_tmp)
+                    bpy.data.meshes.remove(_seg_tmp)
+                else:
+                    _ev_seg = orig.evaluated_get(dg)
+                    _seg_tmp = bpy.data.meshes.new_from_object(_ev_seg)
+                    k = _topo_key(orig, _seg_tmp)
+                    bpy.data.meshes.remove(_seg_tmp)
+                if cur_k is None or k == cur_k:
+                    cur_k = k
                     cur_frames.append(f)
                 else:
-                    seg_groups.append((cur_n, cur_frames))
-                    cur_n, cur_frames = n, [f]
+                    seg_groups.append((cur_k[0], cur_frames))
+                    cur_k, cur_frames = k, [f]
             if cur_frames:
-                seg_groups.append((cur_n, cur_frames))
+                seg_groups.append((cur_k[0] if cur_k is not None else 0, cur_frames))
 
             if len(seg_groups) == 1:
                 seg_M = _setup_seg(orig, bake_frames, primary_baked)
@@ -1335,8 +1468,10 @@ class OBJECT_OT_glb_shapekey_baker(bpy.types.Operator):
                         context.view_layer.objects.active = seg_baked
                         bpy.ops.object.convert(target='MESH')
 
-                        for mod  in list(seg_baked.modifiers):   seg_baked.modifiers.remove(mod)
-                        for con  in list(seg_baked.constraints):  seg_baked.constraints.remove(con)
+                        for mod in list(seg_baked.modifiers):
+                            seg_baked.modifiers.remove(mod)
+                        for con in list(seg_baked.constraints):
+                            seg_baked.constraints.remove(con)
                         seg_baked.animation_data_clear()
                         if seg_baked.data.shape_keys:
                             seg_baked.shape_key_clear()
@@ -1392,9 +1527,9 @@ class OBJECT_OT_glb_shapekey_baker(bpy.types.Operator):
                         continue
                     baked, seg_M = entry
 
-                    temp_mesh = bpy.data.meshes.new_from_object(eval_orig)
+                    M_world   = eval_orig.matrix_world.copy()
+                    temp_mesh = _mesh_from_object(orig, context)
                     M_ref_inv = seg_M.inverted_safe()
-                    M_world   = eval_orig.matrix_world
 
                     # Determine source mesh and projection mode.
                     # Bridge frames: project the previous segment's last-frame
@@ -1407,8 +1542,8 @@ class OBJECT_OT_glb_shapekey_baker(bpy.types.Operator):
                         scene.frame_set(_prev_lf)
                         _bdg_dg      = context.evaluated_depsgraph_get()
                         _bdg_eval    = orig.evaluated_get(_bdg_dg)
-                        _src_mesh    = bpy.data.meshes.new_from_object(_bdg_eval)
-                        _src_M_world = _bdg_eval.matrix_world
+                        _src_M_world = _bdg_eval.matrix_world.copy()
+                        _src_mesh    = _mesh_from_object(orig, context)
                         scene.frame_set(f)
                         depsgraph    = context.evaluated_depsgraph_get()
                         _use_bvh     = True
@@ -1515,18 +1650,25 @@ class OBJECT_OT_glb_shapekey_baker(bpy.types.Operator):
             for seg_idx, (seg_flist, seg_baked, _) in enumerate(segs):
                 first_f, last_f = seg_flist[0], seg_flist[-1]
                 is_last = (seg_idx == n_segs - 1)
+                # Use the next segment's first baked frame as the switch point.
+                # With step > 1, last_f + 1 is not a baked frame — the next segment
+                # starts at last_f + FRAME_STEP.  Placing "off" at last_f + 1 creates
+                # a gap of (FRAME_STEP - 1) frames where both objects are invisible,
+                # causing flicker.  Placing "off" at exactly the next segment's first_f
+                # means the STEP switch is simultaneous on both objects.
+                next_first_f = segs[seg_idx + 1][0][0] if not is_last else None
 
                 if seg_idx == 0:
-                    _kf_scale(seg_baked, ANIM_F0,    1.0)  # on from start
-                    _kf_scale(seg_baked, last_f,     1.0)  # still on at end of segment
-                    _kf_scale(seg_baked, last_f + 1, 0.0)  # off next frame
+                    _kf_scale(seg_baked, ANIM_F0,     1.0)  # on from start
+                    _kf_scale(seg_baked, last_f,      1.0)  # still on at end of segment
+                    _kf_scale(seg_baked, next_first_f, 0.0)  # off exactly when next seg begins
                     seg_baked.scale = (1.0, 1.0, 1.0)
                 else:
                     _kf_scale(seg_baked, ANIM_F0,  0.0)  # off from start
                     _kf_scale(seg_baked, first_f,  1.0)  # on at segment start
                     if not is_last:
-                        _kf_scale(seg_baked, last_f,     1.0)  # still on at end
-                        _kf_scale(seg_baked, last_f + 1, 0.0)  # off next frame
+                        _kf_scale(seg_baked, last_f,       1.0)  # still on at end
+                        _kf_scale(seg_baked, next_first_f, 0.0)  # off exactly when next seg begins
                     seg_baked.scale = (0.0, 0.0, 0.0)
 
         # 6. Linear Interpolation (Blender 5.1 Compliant)
@@ -2023,7 +2165,7 @@ class OBJECT_OT_glb_export(bpy.types.Operator):
             'export_frame_range':     True,
             'export_anim_slide_to_zero': True,
             'export_morph':           True,
-            'export_morph_normal':    False,
+            'export_morph_normal':    True,
             'export_apply':           False,
         }
 
