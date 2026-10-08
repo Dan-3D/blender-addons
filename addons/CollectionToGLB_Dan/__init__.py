@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 5, 8),
+    "version": (1, 5, 9),
     "blender": (4, 5, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -1581,6 +1581,69 @@ class GLBAlphaCollectionItem(PropertyGroup):
         description="Render both sides of faces (needed for fur/foliage cards)")
 
 
+class GLBBakeSkipItem(PropertyGroup):
+    collection_ref: PointerProperty(
+        type=bpy.types.Collection, name="Collection",
+        description="This collection keeps its original materials (not baked)")
+
+
+class GLB_UL_BakeSkip(UIList):
+    bl_idname = "GLB_UL_BakeSkip"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        layout.prop(item, "collection_ref", text="", icon='OUTLINER_COLLECTION')
+
+
+class GLB_OT_AddBakeSkip(Operator):
+    bl_idname = "glb_export.add_bake_skip"
+    bl_label = "Add Collection"
+    bl_description = "Add a new empty entry to the list"
+
+    def execute(self, context):
+        props = context.scene.glb_export_props
+        props.bake_skip_collections.add()
+        props.bake_skip_index = len(props.bake_skip_collections) - 1
+        return {'FINISHED'}
+
+
+class GLB_OT_RemoveBakeSkip(Operator):
+    bl_idname = "glb_export.remove_bake_skip"
+    bl_label = "Remove Collection"
+    bl_description = "Remove the selected entry from the list"
+
+    @classmethod
+    def poll(cls, context):
+        return len(context.scene.glb_export_props.bake_skip_collections) > 0
+
+    def execute(self, context):
+        props = context.scene.glb_export_props
+        idx = props.bake_skip_index
+        if 0 <= idx < len(props.bake_skip_collections):
+            props.bake_skip_collections.remove(idx)
+            props.bake_skip_index = max(0, idx - 1)
+        return {'FINISHED'}
+
+
+class GLB_OT_AddSelectedBakeSkip(Operator):
+    bl_idname = "glb_export.add_selected_bake_skip"
+    bl_label = "Add Collections of Selected Objects"
+    bl_description = "Add the collections the selected objects belong to"
+
+    def execute(self, context):
+        props = context.scene.glb_export_props
+        existing = {i.collection_ref.name for i in props.bake_skip_collections if i.collection_ref}
+        added = 0
+        for obj in context.selected_objects:
+            for coll in obj.users_collection:
+                if coll != context.scene.collection and coll.name not in existing:
+                    item = props.bake_skip_collections.add()
+                    item.collection_ref = coll
+                    existing.add(coll.name)
+                    added += 1
+        self.report({'INFO'}, f"Added {added} collection(s)")
+        return {'FINISHED'}
+
+
 class GLBExportProperties(PropertyGroup):
     
     # UI expand/collapse properties
@@ -1797,6 +1860,15 @@ class GLBExportProperties(PropertyGroup):
     )
     
     alpha_collections: CollectionProperty(type=GLBAlphaCollectionItem)
+    bake_skip_collections: CollectionProperty(type=GLBBakeSkipItem)
+    bake_skip_index: IntProperty(default=0)
+    show_bake_skip: BoolProperty(default=False)
+    bake_use_exceptions: BoolProperty(
+        name="Bake Exceptions",
+        description="Collections in the list keep their original materials (not baked)",
+        default=False,
+    )
+    
     export_running: BoolProperty(default=False, options={'SKIP_SAVE'})
     export_progress: FloatProperty(default=0.0, min=0.0, max=1.0,
                                    subtype='FACTOR', options={'SKIP_SAVE'})
@@ -2456,6 +2528,9 @@ class GLB_OT_ProcessAndExport(Operator):
 
     def process_temp_collection(self, context, temp_collection, original_name, current_idx, total_count):
         props = context.scene.glb_export_props
+
+        skip_names = {i.collection_ref.name for i in props.bake_skip_collections if i.collection_ref}
+        do_bake = props.enable_baking and not (props.bake_use_exceptions and original_name in skip_names)
         
         print(f"\n=== PROCESSING COLLECTION: {original_name} ===")
         
@@ -2769,7 +2844,7 @@ class GLB_OT_ProcessAndExport(Operator):
                     print(f"Warning: Could not pack UVs: {e}")
                     bpy.ops.object.mode_set(mode='OBJECT')
 
-            if props.enable_baking:
+            if do_bake:
                 original_materials = []
                 for slot in joined_obj.material_slots:
                     if slot.material:
@@ -2997,7 +3072,7 @@ class GLB_OT_ProcessAndExport(Operator):
                     print(f"AO-only bake failed: {e}")
                     self.report({'WARNING'}, f"AO bake failed for {original_name}: {e}")
 
-            if not props.enable_baking:
+            if not do_bake:
                 try:
                     a_mode, a_thr, a_ds = resolve_alpha_mode(props, original_name)
                     done = set()
@@ -4452,6 +4527,28 @@ class GLB_PT_ExportPanel(Panel):
                 num_row(col, "bake_samples", "Samples")
                 num_row(col, "bake_margin", "Margin")
 
+            if props.enable_baking:
+                # Bake Exceptions (expandable)
+                row = box.row()
+                row.prop(props, "show_bake_skip",
+                         icon='TRIA_DOWN' if props.show_bake_skip else 'TRIA_RIGHT',
+                         icon_only=True, emboss=False)
+                row.prop(props, "bake_use_exceptions")
+                if props.show_bake_skip:
+                    sub = box.column()
+                    sub.enabled = props.bake_use_exceptions
+                    sub.operator("glb_export.add_selected_bake_skip", icon='RESTRICT_SELECT_OFF')
+                    list_row = sub.row()
+                    list_row.template_list(
+                        "GLB_UL_BakeSkip", "",
+                        props, "bake_skip_collections",
+                        props, "bake_skip_index",
+                        rows=3,
+                    )
+                    btn_col = list_row.column(align=True)
+                    btn_col.operator("glb_export.add_bake_skip", icon='ADD', text="")
+                    btn_col.operator("glb_export.remove_bake_skip", icon='REMOVE', text="")
+
             switch_row(box, "bake_ambient_occlusion", "Ambient Occlusion")
             if props.bake_ambient_occlusion:
                 ao_col = box.column(align=True)
@@ -5052,12 +5149,17 @@ classes = (
     GLBBakeUVTarget,
     GLBAOExceptionItem,
     GLBAlphaCollectionItem,
+    GLBBakeSkipItem,
     GLBExportProperties,
     GLB_UL_CustomUVBakeTargets,
     GLB_OT_ScanCustomUVTargets,
     GLB_OT_AddCustomUVTarget,
     GLB_OT_RemoveCustomUVTarget,
     GLB_OT_ScanAlphaCollections,
+    GLB_UL_BakeSkip,
+    GLB_OT_AddBakeSkip,
+    GLB_OT_RemoveBakeSkip,
+    GLB_OT_AddSelectedBakeSkip,
     GLB_OT_UnwrapSelected,
     GLB_OT_UnwrapCancel,
     GLB_OT_ShowExportReport,
