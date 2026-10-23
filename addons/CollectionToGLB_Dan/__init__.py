@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 5, 9),
+    "version": (1, 6, 1),
     "blender": (4, 5, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -1865,7 +1865,7 @@ class GLBExportProperties(PropertyGroup):
     show_bake_skip: BoolProperty(default=False)
     bake_use_exceptions: BoolProperty(
         name="Bake Exceptions",
-        description="Collections in the list keep their original materials (not baked)",
+        description="Collections in the list keep their original materials and UVs (no bake, unwrap or packing). AO can still be baked onto their existing UVs",
         default=False,
     )
     
@@ -2700,13 +2700,20 @@ class GLB_OT_ProcessAndExport(Operator):
             print(f"Materials use UV coordinates: {materials_use_uvs}")
 
             # Handle UV maps based on detection
-            if (props.uv_unwrap_method != 'NONE' or (props.enable_uv_pack and materials_use_uvs)) and not custom_bake_only:
+            if do_bake and (props.uv_unwrap_method != 'NONE' or (props.enable_uv_pack and materials_use_uvs)) and not custom_bake_only:
                 self.update_progress(context, "UV unwrapping...", current_idx, total_count)
                 
                 if materials_use_uvs:
                     print("Materials use UV coordinates - preserving for baking")
                     
+                    pins = None
+                    old_uv = joined_obj.data.uv_layers.active
+                    if old_uv is not None:
+                        pins = [False] * len(joined_obj.data.loops)
+                        old_uv.data.foreach_get("pin_uv", pins)
                     new_uv = joined_obj.data.uv_layers.new(name="GLB_Bake")
+                    if pins is not None and new_uv is not None:
+                        new_uv.data.foreach_set("pin_uv", pins)
                     joined_obj.data.uv_layers.active = new_uv
                     
                 else:
@@ -2810,7 +2817,7 @@ class GLB_OT_ProcessAndExport(Operator):
                     joined_obj.data.uv_layers.active = joined_obj.data.uv_layers["UVMap"]
 
             # UV PACKING - runs after customs are merged; forced on when they exist
-            if ((props.uv_unwrap_method != 'NONE' or materials_use_uvs) and props.enable_uv_pack and not custom_bake_only) or (has_custom_pinned and not single_custom_only):
+            if do_bake and (((props.uv_unwrap_method != 'NONE' or materials_use_uvs) and props.enable_uv_pack and not custom_bake_only) or (has_custom_pinned and not single_custom_only)):
                 self.update_progress(context, "Packing UVs...", current_idx, total_count)
                 try:
                     context.view_layer.objects.active = joined_obj
@@ -3992,11 +3999,22 @@ class GLB_OT_ProcessAndExport(Operator):
                     if uv_name not in main.data.uv_layers:
                         main.data.uv_layers.new(name=uv_name)
                 else:
-                    # Split-off part: drop UV layers the main object no longer has
-                    main_uvs = {uv.name for uv in main.data.uv_layers}
-                    for name in [uv.name for uv in part.data.uv_layers]:
-                        if name not in main_uvs:
-                            part.data.uv_layers.remove(part.data.uv_layers[name])
+                    # Split-off part: the main object kept only its bake layer
+                    # (renamed to "UVMap"); the part still has the original too.
+                    # Keep the part's bake layer (its active one) and give it the
+                    # main object's name so the join matches the packed coordinates.
+                    main_names = [uv.name for uv in main.data.uv_layers]
+                    part_uvs = part.data.uv_layers
+                    if len(main_names) == 1 and len(part_uvs) > 1 and part_uvs.active is not None:
+                        keep = part_uvs.active.name
+                        for name in [uv.name for uv in part_uvs if uv.name != keep]:
+                            part_uvs.remove(part_uvs[name])
+                        part_uvs[0].name = main_names[0]
+                    else:
+                        main_set = set(main_names)
+                        for name in [uv.name for uv in part_uvs]:
+                            if name not in main_set:
+                                part_uvs.remove(part_uvs[name])
                 
                 bpy.ops.object.select_all(action='DESELECT')
                 part.select_set(True)
