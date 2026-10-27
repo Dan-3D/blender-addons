@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Collection(s) to GLB",
     "author": "Daniel Marcin from 3D Content Team (Prompted in Claude AI)",
-    "version": (1, 6, 1),
+    "version": (1, 6, 2),
     "blender": (4, 5, 0),
     "location": "View3D > N-Panel > GLB Export",
     "description": "Export collections as GLB with automatic scaling and transforms",
@@ -2586,6 +2586,31 @@ class GLB_OT_ProcessAndExport(Operator):
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
             bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+
+        # Unify UV map names before the join, otherwise objects with differently
+        # named maps end up in separate half-empty UV layers
+        custom_names = set()
+        if props.enable_custom_uv_bake:
+            custom_names = {t.object_ref.name for t in props.custom_uv_bake_targets if t.object_ref}
+        for obj in mesh_objects:
+            uvl = obj.data.uv_layers
+            if not uvl or obj.get("original_name", obj.name) in custom_names:
+                continue
+            render = next((l for l in uvl if l.active_render), uvl[0])
+            old = render.name
+            if old != "UVMap":
+                other = uvl.get("UVMap")
+                if other is not None and other != render:
+                    other.name = old + "_other"
+                render.name = "UVMap"
+                for slot in obj.material_slots:
+                    m = slot.material
+                    if m and m.use_nodes:
+                        for n in m.node_tree.nodes:
+                            if n.type in {'UVMAP', 'NORMAL_MAP', 'TANGENT'} and getattr(n, 'uv_map', '') == old:
+                                n.uv_map = "UVMap"
+            uvl.active = render
+            render.active_render = True
         
         # Per-object coordinate correction BEFORE joining, so each object's
         # procedural patterns bake with its own transform values
@@ -3763,6 +3788,38 @@ class GLB_OT_ProcessAndExport(Operator):
             for mat, node in temp_nodes:
                 mat.node_tree.nodes.remove(node)
 
+    def bake_white(self, obj, target_image):
+        """Bake flat white into target_image over obj's UV islands.
+        Small margin on purpose: it must not bleed into neighbouring islands."""
+        temp_nodes, restore = [], []
+        for slot in obj.material_slots:
+            mat = slot.material
+            if not mat or not mat.use_nodes:
+                continue
+            nodes, links = mat.node_tree.nodes, mat.node_tree.links
+            out = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
+            if out is None:
+                continue
+            if out.inputs['Surface'].is_linked:
+                l = out.inputs['Surface'].links[0]
+                restore.append((mat, l.from_socket, out.inputs['Surface']))
+                links.remove(l)
+            rgb = nodes.new('ShaderNodeRGB')
+            rgb.outputs[0].default_value = (1.0, 1.0, 1.0, 1.0)
+            links.new(rgb.outputs[0], out.inputs['Surface'])
+            tex = nodes.new('ShaderNodeTexImage')
+            tex.image = target_image
+            tex.select = True
+            nodes.active = tex
+            temp_nodes += [(mat, rgb), (mat, tex)]
+        try:
+            bpy.ops.object.bake(type='EMIT', use_clear=False, margin=4)
+        finally:
+            for mat, node in temp_nodes:
+                mat.node_tree.nodes.remove(node)
+            for mat, src, dst in restore:
+                mat.node_tree.links.new(src, dst)
+
     def separate_ao_combo(self, context, joined_obj, combo, cast_idx, recv_idx):
         """Separate the geometry matching one (no_cast, no_receive) flag
         combination into its own temporary object. Returns it, or None."""
@@ -3839,6 +3896,8 @@ class GLB_OT_ProcessAndExport(Operator):
                 continue
             part = self.separate_ao_combo(context, joined_obj, combo, cast_idx, recv_idx)
             if part is not None:
+                bake_layer = joined_obj.data.uv_layers.active
+                part["_glb_bake_uv"] = bake_layer.name if bake_layer else ""
                 nc, nr = combo
                 if nc:
                     part["ao_exception"] = True
@@ -3894,6 +3953,22 @@ class GLB_OT_ProcessAndExport(Operator):
             self.bake_ambient_occlusion(part, ao_image, use_clear=False)
             
             part.hide_render = was_hidden
+
+        # No Receive geometry must end up white: bake white over its islands
+        # AFTER the AO passes so the neighbours' bake margin can't bleed into it
+        white_targets = [joined_obj] if main_no_receive else []
+        white_targets += [e['object'] for e in ao_parts
+                          if e['no_receive'] and e['object'].name in bpy.data.objects]
+        for tgt in white_targets:
+            was_hidden = tgt.hide_render
+            tgt.hide_render = False
+            bpy.ops.object.select_all(action='DESELECT')
+            tgt.select_set(True)
+            context.view_layer.objects.active = tgt
+            if bake_uv and bake_uv in tgt.data.uv_layers:
+                tgt.data.uv_layers.active = tgt.data.uv_layers[bake_uv]
+            self.bake_white(tgt, ao_image)
+            tgt.hide_render = was_hidden
         
         bpy.ops.object.select_all(action='DESELECT')
         joined_obj.select_set(True)
@@ -4005,8 +4080,8 @@ class GLB_OT_ProcessAndExport(Operator):
                     # main object's name so the join matches the packed coordinates.
                     main_names = [uv.name for uv in main.data.uv_layers]
                     part_uvs = part.data.uv_layers
-                    if len(main_names) == 1 and len(part_uvs) > 1 and part_uvs.active is not None:
-                        keep = part_uvs.active.name
+                    keep = part.get("_glb_bake_uv") or (part_uvs.active.name if part_uvs.active else "")
+                    if len(main_names) == 1 and len(part_uvs) > 1 and keep in part_uvs:
                         for name in [uv.name for uv in part_uvs if uv.name != keep]:
                             part_uvs.remove(part_uvs[name])
                         part_uvs[0].name = main_names[0]
